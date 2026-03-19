@@ -8,21 +8,8 @@ This project is a Go port and evolution of [flexspace](https://github.com/flexib
 
 ## Architecture
 
-The system is built as a clean stack of four independent packages, each building on the one below:
+The system is built as a clean stack of four independent packages (and 2 executables), each building on the one below:
 
-```
-┌───────────────────────────────────────────────────────┐
-│  cmd/flexctl  — interactive CLI and REPL               │
-├───────────────────────────────────────────────────────┤
-│  flexkv       — named tables + secondary indexes       │
-├───────────────────────────────────────────────────────┤
-│  flexdb       — multi-table store, memtable, cache     │
-├───────────────────────────────────────────────────────┤
-│  flexfile     — flat logical address space + WAL       │
-├───────────────────────────────────────────────────────┤
-│  flextree     — extent-mapped B+tree                   │
-└───────────────────────────────────────────────────────┘
-```
 
 | Package | Role |
 |---------|------|
@@ -31,7 +18,7 @@ The system is built as a clean stack of four independent packages, each building
 | `flexdb` | Adds multi-table management, a double-buffered in-memory memtable (with WAL), a background flush worker, per-table caching, atomic multi-table write batches, and monotonically increasing sequence numbers. |
 | `flexkv` | The user-facing layer: named tables, `Indexer`-function-based secondary indexes maintained atomically with writes, prefix/range scan, and multi-valued index support. |
 | `cmd/flexctl` | A SQLite-style CLI and REPL for administering flexkv databases without writing any code. |
-
+| `cmd/flexsrv` | An authenticated HTTPS key-value service around flexkv. Compatible with flexctl. |
 ---
 
 ## Why It Is Faster Than the C Version
@@ -132,123 +119,16 @@ if err != nil {
 
 ---
 
-## Using flexctl
+## CLI & Remote Service
 
-### Install
+The project includes two executable tools in the `cmd/` directory:
 
-```bash
-git clone https://github.com/brunoga/flexspace-go
-cd flexspace-go
-go build -o flexctl ./cmd/flexctl/
-```
+- **`flexctl`**: A SQLite-style CLI and interactive REPL for local and remote database administration. It supports table management, CRUD operations, secondary indexing, and atomic batches.
+- **`flexsrv`**: An authenticated HTTPS key-value service that exposes a `flexkv` database over the network.
 
-### Interactive REPL
-
-```
-$ ./flexctl /var/data/mydb
-flexctl> create-table users
-table "users" created
-flexctl> put users alice engineer
-flexctl> put users bob designer
-flexctl> scan users
-alice  engineer
-bob    designer
-flexctl> create-index users by_role exact
-index "by_role" created on "users"
-flexctl> index-scan users by_role engineer
-alice  engineer
-flexctl> stats
-=== Database ===
-  Path:         /var/data/mydb
-  Write seq:    4
-  ...
-flexctl> exit
-```
-
-### One-shot commands
-
-```bash
-# Table management
-./flexctl mydb create-table orders
-./flexctl mydb drop-table orders
-
-# CRUD
-./flexctl mydb put  users carol "staff-engineer"
-./flexctl mydb get  users carol
-./flexctl mydb delete users carol
-
-# Scanning
-./flexctl mydb scan   users                  # full scan
-./flexctl mydb scan   users alice carol       # range [alice, carol)
-./flexctl mydb prefix users ali              # keys starting with "ali"
-
-# Secondary indexes
-./flexctl mydb create-index users by_dept field 0   # field 0, comma-delimited
-./flexctl mydb create-index users by_age  field 1
-./flexctl mydb create-index users by_name exact
-./flexctl mydb create-index users by_pfx  prefix 3
-./flexctl mydb drop-index   users by_pfx
-./flexctl mydb index-scan   users by_dept engineering
-
-# Bulk operations
-./flexctl mydb dump  backup.json            # export all tables
-./flexctl mydb load  backup.json            # import
-
-# Atomic batch (JSON)
-./flexctl mydb batch ops.json
-
-# Schema management
-./flexctl mydb schema dump schema.json      # export current schema
-./flexctl mydb schema load schema.json      # apply schema (creates tables/indexes)
-
-# Statistics
-./flexctl mydb stats
-```
-
-### Batch file format
-
-```json
-{
-  "checks": [
-    { "table": "inventory", "key": "widget-A", "expected": "42" }
-  ],
-  "ops": [
-    { "op": "put",    "table": "inventory", "key": "widget-A", "value": "41" },
-    { "op": "delete", "table": "staging",   "key": "widget-A" }
-  ]
-}
-```
-
-If any `check` fails the entire batch is rejected without applying any `ops`.
-
-### Schema file format
-
-```json
-{
-  "version": 1,
-  "tables": [
-    {
-      "name": "users",
-      "indexes": [
-        { "name": "by_dept",  "type": "field",  "field": 0 },
-        { "name": "by_level", "type": "field",  "field": 1, "delim": "," },
-        { "name": "by_role",  "type": "exact" },
-        { "name": "by_pfx",   "type": "prefix", "length": 4 },
-        { "name": "by_sfx",   "type": "suffix", "length": 4 }
-      ]
-    }
-  ]
-}
-```
-
-### Index types
-
-| Type | Syntax | Indexed value |
-|------|--------|---------------|
-| `exact` | `create-index T I exact` | entire value |
-| `prefix` | `create-index T I prefix N` | first N bytes |
-| `suffix` | `create-index T I suffix N` | last N bytes |
-| `field` | `create-index T I field N [delim]` | Nth field split by delim (default `,`) |
+For detailed usage, installation, and configuration instructions, see:
+- [**`cmd/flexctl/README.md`**](./cmd/flexctl/README.md)
+- [**`cmd/flexsrv/README.md`**](./cmd/flexsrv/README.md)
 
 ---
 
@@ -261,7 +141,8 @@ flexspace-go/
 ├── flexdb/          Multi-table KV store (memtable, cache, batches, sequence numbers)
 ├── flexkv/          Secondary-index layer (named tables, Indexer functions)
 ├── cmd/
-│   └── flexctl/     CLI and interactive REPL
+│   ├── flexctl/     CLI and interactive REPL
+│   └── flexsrv/     Authenticated HTTPS KV service
 ├── go.mod
 └── LICENSE
 ```
@@ -280,8 +161,7 @@ go build ./...
 go test ./...
 
 # Run benchmarks
-go test -bench=. -benchmem ./flexdb/
-go test -bench=. -benchmem ./flextree/
+go test -bench=. -benchmem ./...
 
 # Build the CLI
 go build -o flexctl ./cmd/flexctl/
