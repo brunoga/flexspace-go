@@ -22,8 +22,10 @@ type SchemaStore struct {
 }
 
 // loadAndRegisterSchema opens (or creates) the schema file and re-registers
-// all indexers on the already-open database.
-func loadAndRegisterSchema(db *flexkv.DB, dbPath string) (*SchemaStore, error) {
+// all indexers on the already-open database. It returns the SchemaStore and a
+// map of the table handles it opened, which the Server uses as its initial
+// cache so indexers survive across requests.
+func loadAndRegisterSchema(db *flexkv.DB, dbPath string) (*SchemaStore, map[string]*flexkv.Table, error) {
 	ss := &SchemaStore{
 		db:   db,
 		path: filepath.Join(dbPath, schemaFile),
@@ -31,34 +33,36 @@ func loadAndRegisterSchema(db *flexkv.DB, dbPath string) (*SchemaStore, error) {
 
 	data, err := os.ReadFile(ss.path)
 	if err != nil && !os.IsNotExist(err) {
-		return nil, fmt.Errorf("read %s: %w", ss.path, err)
+		return nil, nil, fmt.Errorf("read %s: %w", ss.path, err)
 	}
 	if len(data) > 0 {
 		if err := json.Unmarshal(data, &ss.schema); err != nil {
-			return nil, fmt.Errorf("parse %s: %w", ss.path, err)
+			return nil, nil, fmt.Errorf("parse %s: %w", ss.path, err)
 		}
 	}
 
 	// Re-register every known indexer. We use RegisterIndex (not CreateIndex)
 	// because the index data is already on disk; we just need to reattach the
 	// in-memory function so that future writes keep the index current.
+	tables := make(map[string]*flexkv.Table)
 	for _, tbl := range ss.schema.Tables {
 		t, err := db.Table(tbl.Name)
 		if err != nil {
-			return nil, fmt.Errorf("open table %q: %w", tbl.Name, err)
+			return nil, nil, fmt.Errorf("open table %q: %w", tbl.Name, err)
 		}
+		tables[tbl.Name] = t
 		for _, idx := range tbl.Indexes {
 			fn, err := makeIndexer(idx)
 			if err != nil {
-				return nil, fmt.Errorf("index %s.%s: %w", tbl.Name, idx.Name, err)
+				return nil, nil, fmt.Errorf("index %s.%s: %w", tbl.Name, idx.Name, err)
 			}
 			if err := t.RegisterIndex(idx.Name, fn); err != nil {
-				return nil, fmt.Errorf("register index %s.%s: %w", tbl.Name, idx.Name, err)
+				return nil, nil, fmt.Errorf("register index %s.%s: %w", tbl.Name, idx.Name, err)
 			}
 		}
 	}
 
-	return ss, nil
+	return ss, tables, nil
 }
 
 // Get returns a snapshot of the current schema.

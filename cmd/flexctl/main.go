@@ -13,11 +13,11 @@
 //	table scan    <table> [start [end]] [--limit N]    Range scan
 //	table scan prefix <table> <prefix> [--limit N]     Prefix scan
 //
-//	value get     <table> <key>                        Print value; exit 1 if not found
+//	value get     <table> <key> [index]                Print value; with index, print all index matches
 //	value put     <table> <key> <value>                Insert or update
 //	value delete  <table> <key>                        Delete a key
 //	value exists  <table> <key>                        Exit 0 if present, 1 if absent
-//	value count   <table>                              Count entries
+//	value count   <table> [index]                      Count entries; with index, count index entries
 //
 //	index list    <table>                              List indexes on a table
 //	index create  <table> <name> <type> [opts]         Create a secondary index
@@ -176,6 +176,21 @@ func extractLimit(args []string) ([]string, int) {
 	return out, limit
 }
 
+// nextKey returns the smallest key greater than key in lexicographic order,
+// used to form an exclusive upper bound for an exact-match index range.
+// Returns nil if key is all 0xFF bytes (no upper bound needed).
+func nextKey(key []byte) []byte {
+	next := make([]byte, len(key))
+	copy(next, key)
+	for i := len(next) - 1; i >= 0; i-- {
+		next[i]++
+		if next[i] != 0 {
+			return next
+		}
+	}
+	return nil
+}
+
 // makeIndexer returns a flexkv.Indexer for the given SchemaIndex.
 func makeIndexer(idx SchemaIndex) (flexkv.Indexer, error) {
 	switch idx.Type {
@@ -234,11 +249,12 @@ func makeIndexer(idx SchemaIndex) (flexkv.Indexer, error) {
 
 // ctx holds an open database (local or remote) and schema state.
 type ctx struct {
-	db     *flexkv.DB            // nil when remote != nil
-	path   string                // DB file path or server URL
+	db     *flexkv.DB               // nil when remote != nil
+	path   string                   // DB file path or server URL
 	schema map[string][]SchemaIndex // table → index defs (local only)
-	batch  *BatchFile            // active interactive batch, if any
-	remote *RemoteClient         // non-nil when connected to a flexsrv
+	tables map[string]*flexkv.Table // table name → cached handle (local only)
+	batch  *BatchFile               // active interactive batch, if any
+	remote *RemoteClient            // non-nil when connected to a flexsrv
 }
 
 // openCtx opens a local database or initialises a remote client depending on
@@ -268,7 +284,7 @@ func openCtx(path string) *ctx {
 	db, err := flexkv.Open(path, &flexkv.Options{CacheMB: 64})
 	check(err, "open db")
 
-	c := &ctx{db: db, path: path, schema: make(map[string][]SchemaIndex)}
+	c := &ctx{db: db, path: path, schema: make(map[string][]SchemaIndex), tables: make(map[string]*flexkv.Table)}
 
 	st, err := db.Table(schemaTable)
 	check(err, "open schema table")
@@ -290,6 +306,7 @@ func openCtx(path string) *ctx {
 			fmt.Fprintf(os.Stderr, "flexctl: warning: could not open table %q: %v\n", tableName, err)
 			continue
 		}
+		c.tables[tableName] = tbl
 		for _, idx := range indexes {
 			fn, err := makeIndexer(idx)
 			if err != nil {
@@ -311,9 +328,14 @@ func (c *ctx) close() {
 }
 
 // table returns a *flexkv.Table by name, dying on error.
+// The handle is cached so that registered indexers survive across commands.
 func (c *ctx) table(name string) *flexkv.Table {
+	if tbl, ok := c.tables[name]; ok {
+		return tbl
+	}
 	tbl, err := c.db.Table(name)
 	check(err, "open table "+name)
+	c.tables[name] = tbl
 	return tbl
 }
 
@@ -404,6 +426,7 @@ func cmdTableDrop(c *ctx, args []string) {
 		return
 	}
 	check(c.db.DropTable(name), "drop table")
+	delete(c.tables, name)
 	// Remove schema entry too.
 	st := c.table(schemaTable)
 	check(st.Delete([]byte(name)), "remove schema entry")
@@ -473,8 +496,22 @@ func cmdValueEntity(c *ctx, args []string) {
 }
 
 func cmdValueGet(c *ctx, args []string) {
-	if len(args) != 2 {
-		die("value get requires <table> <key>")
+	if len(args) < 2 || len(args) > 3 {
+		die("value get requires <table> <key> [index]")
+	}
+	// Optional index: treat key as an indexed value and return all matches.
+	if len(args) == 3 {
+		tableName, key, indexName := args[0], []byte(args[1]), args[2]
+		if c.remote != nil {
+			it := c.remote.IndexScan(tableName, indexName, key, nextKey(key), 0)
+			defer it.Close()
+			printIndexScan(it, 0)
+			return
+		}
+		it := c.table(tableName).Index(indexName).Get(key)
+		defer it.Close()
+		printIndexScan(it, 0)
+		return
 	}
 	if c.remote != nil {
 		val := c.remote.Get(args[0], args[1])
@@ -577,8 +614,24 @@ func cmdValueExists(c *ctx, args []string) {
 }
 
 func cmdValueCount(c *ctx, args []string) {
-	if len(args) != 1 {
-		die("value count requires <table>")
+	if len(args) < 1 || len(args) > 2 {
+		die("value count requires <table> [index]")
+	}
+	// Optional index: count entries in the index instead of the primary table.
+	if len(args) == 2 {
+		tableName, indexName := args[0], args[1]
+		if c.remote != nil {
+			fmt.Println(c.remote.IndexCount(tableName, indexName))
+			return
+		}
+		it := c.table(tableName).Index(indexName).Scan(nil, nil)
+		defer it.Close()
+		n := 0
+		for ; it.Valid(); it.Next() {
+			n++
+		}
+		fmt.Println(n)
+		return
 	}
 	if c.remote != nil {
 		fmt.Println(c.remote.Count(args[0]))
@@ -1791,11 +1844,11 @@ const replHelp = `Commands (omit db-path — it was given on startup):
   table scan    <table> [start [end]] [--limit N]
   table scan prefix <table> <prefix> [--limit N]
 
-  value get     <table> <key>
+  value get     <table> <key> [index]
   value put     <table> <key> <value>
   value delete  <table> <key>
   value exists  <table> <key>
-  value count   <table>
+  value count   <table> [index]
 
   index list    <table>
   index create  <table> <name> exact
@@ -1838,11 +1891,11 @@ Commands:
   table scan    <table> [start [end]] [--limit N]         Range scan [start, end)
   table scan prefix <table> <prefix> [--limit N]          Prefix scan
 
-  value get     <table> <key>                             Print value; exit 1 if not found
+  value get     <table> <key> [index]                     Print value; with index, print all index matches
   value put     <table> <key> <value>                     Insert or update a key-value pair
   value delete  <table> <key>                             Delete a key
   value exists  <table> <key>                             Exit 0 if present, 1 if absent
-  value count   <table>                                   Count entries in a table
+  value count   <table> [index]                           Count entries; with index, count index entries
 
   index list    <table>                                   List indexes on a table
   index create  <table> <name> <type> [opts]              Create a secondary index

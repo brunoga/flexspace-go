@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/brunoga/flexspace-go/flexkv"
@@ -63,14 +64,38 @@ func apiError(w http.ResponseWriter, status int, msg string) {
 
 // Server holds all shared state for the HTTP handlers.
 type Server struct {
-	db      *flexkv.DB
-	ss      *SchemaStore
-	cfg     *Config
-	metrics *Metrics
+	db          *flexkv.DB
+	ss          *SchemaStore
+	cfg         *Config
+	metrics     *Metrics
+	tablesMu    sync.RWMutex
+	tablesCache map[string]*flexkv.Table
 }
 
-func newServer(db *flexkv.DB, ss *SchemaStore, cfg *Config) *Server {
-	return &Server{db: db, ss: ss, cfg: cfg, metrics: newMetrics()}
+func newServer(db *flexkv.DB, ss *SchemaStore, cfg *Config, initialTables map[string]*flexkv.Table) *Server {
+	if initialTables == nil {
+		initialTables = make(map[string]*flexkv.Table)
+	}
+	return &Server{db: db, ss: ss, cfg: cfg, metrics: newMetrics(), tablesCache: initialTables}
+}
+
+// table returns a cached *flexkv.Table handle, opening it on first use.
+// Using the same handle across requests preserves registered indexers.
+func (s *Server) table(name string) (*flexkv.Table, error) {
+	s.tablesMu.RLock()
+	tbl, ok := s.tablesCache[name]
+	s.tablesMu.RUnlock()
+	if ok {
+		return tbl, nil
+	}
+	tbl, err := s.table(name)
+	if err != nil {
+		return nil, err
+	}
+	s.tablesMu.Lock()
+	s.tablesCache[name] = tbl
+	s.tablesMu.Unlock()
+	return tbl, nil
 }
 
 // statusWriter wraps http.ResponseWriter to capture the written status code.
@@ -157,6 +182,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc(s.track("HEAD /v1/tables/{table}/keys/{key...}", s.handleExists))
 	mux.HandleFunc(s.track("GET /v1/tables/{table}/scan", s.handleScan))
 	mux.HandleFunc(s.track("GET /v1/tables/{table}/indexes", s.handleListIndexes))
+	mux.HandleFunc(s.track("GET /v1/tables/{table}/indexes/{index}/count", s.handleIndexCount))
 	mux.HandleFunc(s.track("GET /v1/tables/{table}/indexes/{index}/scan", s.handleIndexScan))
 	mux.HandleFunc(s.track("GET /v1/schema", s.handleDumpSchema))
 	mux.HandleFunc(s.track("GET /v1/dump", s.handleDumpData))
@@ -294,7 +320,7 @@ func (s *Server) handleCreateTable(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusBadRequest, "name is required")
 		return
 	}
-	if _, err := s.db.Table(req.Name); err != nil {
+	if _, err := s.table(req.Name); err != nil { // opens and caches the handle
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -314,6 +340,9 @@ func (s *Server) handleDropTable(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.tablesMu.Lock()
+	delete(s.tablesCache, table)
+	s.tablesMu.Unlock()
 	if err := s.ss.RemoveTable(table); err != nil {
 		slog.Warn("schema remove table", "table", table, "err", err)
 	}
@@ -325,12 +354,31 @@ func (s *Server) handleCount(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusForbidden, "read role required")
 		return
 	}
-	tbl, err := s.db.Table(r.PathValue("table"))
+	tbl, err := s.table(r.PathValue("table"))
 	if err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	it := tbl.Scan(nil, nil)
+	defer it.Close()
+	n := 0
+	for ; it.Valid(); it.Next() {
+		n++
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"count": n})
+}
+
+func (s *Server) handleIndexCount(w http.ResponseWriter, r *http.Request) {
+	if !hasRole(r, roleRead) {
+		apiError(w, http.StatusForbidden, "read role required")
+		return
+	}
+	tbl, err := s.table(r.PathValue("table"))
+	if err != nil {
+		apiError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	it := tbl.Index(r.PathValue("index")).Scan(nil, nil)
 	defer it.Close()
 	n := 0
 	for ; it.Valid(); it.Next() {
@@ -351,7 +399,7 @@ func (s *Server) handleTableStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tableName := r.PathValue("table")
-	tbl, err := s.db.Table(tableName)
+	tbl, err := s.table(tableName)
 	if err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -399,7 +447,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusForbidden, "read role required")
 		return
 	}
-	tbl, err := s.db.Table(r.PathValue("table"))
+	tbl, err := s.table(r.PathValue("table"))
 	if err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -424,7 +472,7 @@ func (s *Server) handleExists(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusForbidden, "read role required")
 		return
 	}
-	tbl, err := s.db.Table(r.PathValue("table"))
+	tbl, err := s.table(r.PathValue("table"))
 	if err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -458,7 +506,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("value exceeds max_value_bytes (%d)", s.cfg.Limits.MaxValueBytes))
 		return
 	}
-	tbl, err := s.db.Table(r.PathValue("table"))
+	tbl, err := s.table(r.PathValue("table"))
 	if err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -475,7 +523,7 @@ func (s *Server) handleDeleteKey(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusForbidden, "write role required")
 		return
 	}
-	tbl, err := s.db.Table(r.PathValue("table"))
+	tbl, err := s.table(r.PathValue("table"))
 	if err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -506,7 +554,7 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	tbl, err := s.db.Table(r.PathValue("table"))
+	tbl, err := s.table(r.PathValue("table"))
 	if err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -592,7 +640,7 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tableName := r.PathValue("table")
-	tbl, err := s.db.Table(tableName)
+	tbl, err := s.table(tableName)
 	if err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -616,7 +664,7 @@ func (s *Server) handleDropIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	tableName := r.PathValue("table")
 	indexName := r.PathValue("index")
-	tbl, err := s.db.Table(tableName)
+	tbl, err := s.table(tableName)
 	if err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -656,7 +704,7 @@ func (s *Server) handleIndexScan(w http.ResponseWriter, r *http.Request) {
 
 	tableName := r.PathValue("table")
 	indexName := r.PathValue("index")
-	tbl, err := s.db.Table(tableName)
+	tbl, err := s.table(tableName)
 	if err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -772,7 +820,7 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 		if t, ok := tableCache[name]; ok {
 			return t, nil
 		}
-		t, err := s.db.Table(name)
+		t, err := s.table(name)
 		if err != nil {
 			return nil, err
 		}
@@ -891,7 +939,7 @@ func (s *Server) handleLoadSchema(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, tblSpec := range sc.Tables {
-		tbl, err := s.db.Table(tblSpec.Name)
+		tbl, err := s.table(tblSpec.Name)
 		if err != nil {
 			apiError(w, http.StatusInternalServerError, "open table "+tblSpec.Name+": "+err.Error())
 			return
@@ -958,7 +1006,7 @@ func (s *Server) handleDumpData(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, name := range names {
-		tbl, err := s.db.Table(name)
+		tbl, err := s.table(name)
 		if err != nil {
 			slog.Warn("dump: open table", "table", name, "err", err)
 			continue
@@ -1011,7 +1059,7 @@ func (s *Server) handleLoadData(w http.ResponseWriter, r *http.Request) {
 		}
 		switch l.Type {
 		case "table":
-			t, err := s.db.Table(l.Name)
+			t, err := s.table(l.Name)
 			if err != nil {
 				errors = append(errors, "open table "+l.Name+": "+err.Error())
 				curTbl = nil

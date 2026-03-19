@@ -195,8 +195,8 @@ All scan commands accept `--limit N` (or `-n N`) to stop after N results.
 
 ```bash
 ./flexctl mydb value put    users alice "engineering,senior,90000"
-./flexctl mydb value get    users alice        # exits 1 if not found
-./flexctl mydb value exists users alice        # exits 0 if found, 1 if absent; no output
+./flexctl mydb value get    users alice              # exits 1 if not found
+./flexctl mydb value exists users alice              # exits 0 if found, 1 if absent; no output
 ./flexctl mydb value delete users alice
 ./flexctl mydb value count  users
 ```
@@ -207,6 +207,20 @@ All scan commands accept `--limit N` (or `-n N`) to stop after N results.
 if ./flexctl mydb value get users alice > /dev/null; then
   echo "alice exists"
 fi
+```
+
+#### Looking up by index
+
+Pass an index name as an optional third argument to `value get` or `value count` to operate through a secondary index instead of the primary key.
+
+```bash
+# Find all records whose "by_dept" indexed value is exactly "engineering".
+# Output: indexed_value  primary_key  record  (tab-separated, one row per match)
+./flexctl mydb value get users engineering by_dept
+
+# Count how many records are indexed under "by_dept" (may differ from primary
+# count for multi-valued indexes where one record produces multiple entries).
+./flexctl mydb value count users by_dept
 ```
 
 ### Secondary indexes

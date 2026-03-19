@@ -395,6 +395,13 @@ Returns `201 Created` with the echo of the index spec.
 #### `DELETE /v1/tables/{table}/indexes/{index}` — admin
 Drop an index. Returns `204 No Content`.
 
+#### `GET /v1/tables/{table}/indexes/{index}/count` — read
+Count the number of entries in an index. For single-valued indexes this equals the primary table count; for multi-valued indexes it may be higher.
+
+```json
+{ "count": 1042 }
+```
+
 #### `GET /v1/tables/{table}/indexes/{index}/scan` — read
 
 Streams index entries as **NDJSON**. Values are strings; records are base64-encoded.

@@ -200,6 +200,12 @@ func (rc *RemoteClient) Count(table string) int {
 	return r.Count
 }
 
+func (rc *RemoteClient) IndexCount(table, index string) int {
+	var r struct{ Count int `json:"count"` }
+	rc.doJSON("GET", "/tables/"+url.PathEscape(table)+"/indexes/"+url.PathEscape(index)+"/count", nil, &r)
+	return r.Count
+}
+
 // ---- scan iterators ---------------------------------------------------------
 
 // remoteScanIter streams NDJSON from a GET /v1/tables/{table}/scan response.

@@ -37,6 +37,7 @@
 //	GET  /v1/tables/{table}/indexes                     List indexes
 //	POST /v1/tables/{table}/indexes                     Create index (SchemaIndex JSON)
 //	DEL  /v1/tables/{table}/indexes/{index}             Drop index
+//	GET  /v1/tables/{table}/indexes/{index}/count       Count index entries
 //	GET  /v1/tables/{table}/indexes/{index}/scan?start=&end=&prefix=&value=&limit=N&records=true
 //	     Streams NDJSON: {"indexed_value":"...","primary_key":"...","record":"<base64>"}
 //
@@ -146,7 +147,7 @@ func cmdServe() {
 	}
 	defer db.Close()
 
-	ss, err := loadAndRegisterSchema(db, cfg.DBPath)
+	ss, initialTables, err := loadAndRegisterSchema(db, cfg.DBPath)
 	if err != nil {
 		slog.Error("schema", "err", err)
 		os.Exit(1)
@@ -178,7 +179,7 @@ func cmdServe() {
 		"log_level", *logLevel,
 	)
 
-	srv := newServer(db, ss, cfg)
+	srv := newServer(db, ss, cfg, initialTables)
 	httpSrv := &http.Server{
 		Addr:        cfg.Listen,
 		Handler:     srv.routes(),
