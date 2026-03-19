@@ -1,0 +1,163 @@
+package flexdb
+
+import "bytes"
+
+// Batch collects Put/Delete operations across one or more tables and commits
+// them atomically: written as a single WAL record, then applied to the shared
+// memtable under one lock acquisition.
+//
+// Conditions added via Check are evaluated atomically during Commit under the
+// same write-lock acquisition as the writes. If any condition fails, no writes
+// are applied and Commit returns (false, nil).
+type Batch struct {
+	db     *DB
+	ops    []batchOp
+	checks []batchCheck
+}
+
+type batchOp struct {
+	table *Table
+	key   []byte // user key (without tableID prefix)
+	value []byte // nil = delete (tombstone)
+}
+
+type batchCheck struct {
+	table    *Table
+	key      []byte // user key
+	expected []byte // nil = key must be absent
+}
+
+// NewBatch creates a new empty write batch.
+func (db *DB) NewBatch() *Batch {
+	return &Batch{db: db}
+}
+
+// Put adds a put operation to the batch.
+func (b *Batch) Put(table *Table, key, value []byte) {
+	k := make([]byte, len(key))
+	copy(k, key)
+	v := make([]byte, len(value))
+	copy(v, value)
+	b.ops = append(b.ops, batchOp{table: table, key: k, value: v})
+}
+
+// Delete adds a delete (tombstone) operation to the batch.
+func (b *Batch) Delete(table *Table, key []byte) {
+	k := make([]byte, len(key))
+	copy(k, key)
+	b.ops = append(b.ops, batchOp{table: table, key: k, value: nil})
+}
+
+// Check adds a pre-condition: the batch will only be committed if the current
+// value of key equals expected at the time of Commit. Pass nil expected to
+// require the key to be absent.
+func (b *Batch) Check(table *Table, key, expected []byte) {
+	k := make([]byte, len(key))
+	copy(k, key)
+	var e []byte
+	if expected != nil {
+		e = make([]byte, len(expected))
+		copy(e, expected)
+	}
+	b.checks = append(b.checks, batchCheck{table: table, key: k, expected: e})
+}
+
+// Commit atomically evaluates all conditions and, if they all pass, writes all
+// operations to the WAL and applies them to the shared memtable.
+//
+// Returns (true, nil) if all conditions passed and the writes were applied.
+// Returns (false, nil) if any condition failed; no writes are applied.
+// Returns (false, err) on a system error.
+func (b *Batch) Commit() (bool, error) {
+	if len(b.ops) == 0 && len(b.checks) == 0 {
+		return true, nil
+	}
+	db := b.db
+
+	// Validate all ops before touching shared state.
+	for _, op := range b.ops {
+		if len(op.key) == 0 || len(op.key)+len(op.value) > MaxKVSize {
+			return false, errInvalidKV
+		}
+	}
+
+	// Build tableID-prefixed keys for each op.
+	pops := make([]walBatchOp, len(b.ops))
+	for i, op := range b.ops {
+		pops[i] = walBatchOp{
+			pkey:  makePrefixedKey(op.table.id, op.key),
+			value: op.value,
+		}
+	}
+
+	// Wait if the active memtable is full.
+	for db.activeMT().isFull() {
+	}
+
+	// Acquire ALL memtable write locks to ensure atomicity.
+	for i := range db.rwMT {
+		db.rwMT[i].Lock()
+	}
+	defer func() {
+		for i := range db.rwMT {
+			db.rwMT[i].Unlock()
+		}
+	}()
+
+	// Evaluate conditions. Reads under the write locks are safe: no swap can
+	// occur while we hold all 16 locks, so the active MT is stable.
+	for _, chk := range b.checks {
+		cur := b.readCurrent(chk.table, chk.key)
+		if !bytes.Equal(cur, chk.expected) {
+			return false, nil
+		}
+	}
+
+	seq := db.seqNum.Add(1)
+	mt := db.activeMT()
+
+	// Write one atomic WAL record for the entire batch.
+	mt.logAppendBatch(pops, seq)
+
+	// Apply all ops to the skip list.
+	for _, op := range pops {
+		sz := int64(kv128EncodedSize(len(op.pkey), len(op.value)))
+		mt.m.Set(op.pkey, op.value)
+		mt.size.Add(sz)
+	}
+
+	return true, nil
+}
+
+// readCurrent reads the current value of key in table, checking active MT →
+// immutable MT → flexfile. Must be called while holding all rwMT write locks.
+// Returns nil if the key is absent or has a tombstone.
+func (b *Batch) readCurrent(table *Table, key []byte) []byte {
+	db := b.db
+	pkey := makePrefixedKey(table.id, key)
+
+	// Active memtable (hidden cannot be true: we hold all write locks).
+	if val, ok := db.activeMT().get(pkey); ok {
+		if len(val) == 0 {
+			return nil // tombstone
+		}
+		return val
+	}
+	// Immutable memtable (also stable: swap requires all write locks).
+	if val, ok := db.immutableMT().get(pkey); ok {
+		if len(val) == 0 {
+			return nil
+		}
+		return val
+	}
+	// Flexfile (lock order: rwMT → rwFF, same as the flush path).
+	h := hash32(key)
+	ffLockID := h & (lockShards - 1)
+	table.rwFF[ffLockID].RLock()
+	val := table.getPassthrough(key, table.itvbuf, fp16(h))
+	table.rwFF[ffLockID].RUnlock()
+	if len(val) == 0 {
+		return nil
+	}
+	return val
+}
