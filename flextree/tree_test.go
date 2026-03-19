@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"slices"
 	"testing"
 	"time"
 )
@@ -407,4 +408,522 @@ func TestSyncLoadRoundTrip(t *testing.T) {
 		t.Fatalf("second load invariants: %v", err)
 	}
 	_ = os.RemoveAll // silence unused import if any
+}
+
+// TestUpdatePoff verifies that UpdatePoff correctly updates physical offsets
+// of existing extents when loff and length match.
+func TestUpdatePoff(t *testing.T) {
+	tree := NewTree(128 * 1024)
+
+	// Insert an extent
+	if err := tree.Insert(0, 1000, 100); err != nil {
+		t.Fatal(err)
+	}
+
+	// Update its physical offset
+	if err := tree.UpdatePoff(0, 5000, 100); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the update took effect
+	res := tree.Query(0, 100, nil)
+	if len(res) != 1 || res[0].Poff != 5000 {
+		t.Fatalf("UpdatePoff failed: expected poff=5000, got %d", res[0].Poff)
+	}
+
+	if err := tree.CheckInvariants(); err != nil {
+		t.Fatalf("invariants after UpdatePoff: %v", err)
+	}
+}
+
+// TestUpdatePoffMismatch verifies UpdatePoff returns error when loff or length
+// don't match the actual extent.
+func TestUpdatePoffMismatch(t *testing.T) {
+	tree := NewTree(128 * 1024)
+
+	if err := tree.Insert(0, 1000, 100); err != nil {
+		t.Fatal(err)
+	}
+
+	// Try to update with wrong length
+	err := tree.UpdatePoff(0, 5000, 50) // actual length is 100
+	if err == nil {
+		t.Fatal("UpdatePoff should return error on length mismatch")
+	}
+
+	// Try to update at wrong offset
+	err = tree.UpdatePoff(50, 5000, 50)
+	if err == nil {
+		t.Fatal("UpdatePoff should return error at non-extent boundary")
+	}
+}
+
+// TestUpdatePoffOutOfRange verifies UpdatePoff returns error for out-of-range offsets.
+func TestUpdatePoffOutOfRange(t *testing.T) {
+	tree := NewTree(128 * 1024)
+
+	if err := tree.Insert(0, 1000, 100); err != nil {
+		t.Fatal(err)
+	}
+
+	err := tree.UpdatePoff(150, 5000, 100) // beyond MaxLoff
+	if err != ErrOutOfRange {
+		t.Fatalf("UpdatePoff out-of-range: expected ErrOutOfRange, got %v", err)
+	}
+}
+
+// TestIterateExtents verifies that IterateExtents visits all extents in order.
+func TestIterateExtents(t *testing.T) {
+	tree := NewTree(128 * 1024)
+
+	// Build a tree with known extents
+	expectedCount := 0
+	for i := 0; i < 10; i++ {
+		if err := tree.Insert(uint64(i*100), uint64((i+1)*1000), 100); err != nil {
+			t.Fatal(err)
+		}
+		expectedCount++
+	}
+
+	// Track extents collected by iteration
+	var collected []struct {
+		loff   uint64
+		poff   uint64
+		length uint32
+		tag    uint16
+	}
+
+	tree.IterateExtents(func(loff, poff uint64, length uint32, tag uint16) bool {
+		collected = append(collected, struct {
+			loff   uint64
+			poff   uint64
+			length uint32
+			tag    uint16
+		}{loff, poff, length, tag})
+		return true // continue iteration
+	})
+
+	if len(collected) != expectedCount {
+		t.Fatalf("IterateExtents: expected %d extents, collected %d", expectedCount, len(collected))
+	}
+
+	// Verify logical offsets are in order and match what we inserted
+	for i, ext := range collected {
+		if ext.loff != uint64(i*100) {
+			t.Fatalf("extent %d: expected loff=%d, got %d", i, i*100, ext.loff)
+		}
+		if ext.length != 100 {
+			t.Fatalf("extent %d: expected length=100, got %d", i, ext.length)
+		}
+	}
+}
+
+// TestIterateExtentsWithTags verifies tags are correctly reported during iteration.
+func TestIterateExtentsWithTags(t *testing.T) {
+	tree := NewTree(128 * 1024)
+
+	// Insert extents with tags
+	if err := tree.InsertWithTag(0, 1000, 100, 42); err != nil {
+		t.Fatal(err)
+	}
+	if err := tree.InsertWithTag(100, 2000, 100, 99); err != nil {
+		t.Fatal(err)
+	}
+	if err := tree.InsertWithTag(200, 3000, 100, 0); err != nil { // no tag (0)
+		t.Fatal(err)
+	}
+
+	var collected []uint16
+	tree.IterateExtents(func(loff, poff uint64, length uint32, tag uint16) bool {
+		collected = append(collected, tag)
+		return true
+	})
+
+	expected := []uint16{42, 99, 0}
+	if len(collected) != len(expected) {
+		t.Fatalf("expected %d extents, got %d", len(expected), len(collected))
+	}
+
+	for i, tag := range collected {
+		if tag != expected[i] {
+			t.Fatalf("extent %d: expected tag=%d, got %d", i, expected[i], tag)
+		}
+	}
+}
+
+// TestIterateExtentsEarlyStop verifies iteration stops when callback returns false.
+func TestIterateExtentsEarlyStop(t *testing.T) {
+	tree := NewTree(128 * 1024)
+
+	// Build a tree with multiple extents
+	for i := 0; i < 20; i++ {
+		if err := tree.Insert(uint64(i*100), uint64(i+1000), 100); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Iterate but stop after 5 extents
+	count := 0
+	tree.IterateExtents(func(loff, poff uint64, length uint32, tag uint16) bool {
+		count++
+		return count < 5 // stop when count reaches 5
+	})
+
+	if count != 5 {
+		t.Fatalf("early stop: expected 5 iterations, got %d", count)
+	}
+}
+
+// TestHighVolumeAppend verifies the tree handles 1 million append operations correctly.
+// This is a stress test for the append-only insertion path.
+func TestHighVolumeAppend(t *testing.T) {
+	tree := NewTree(128 << 10) // 128KB max extent
+	for i := range 1000000 {
+		poff := uint64(i) * 1024
+		if err := tree.Insert(tree.MaxLoff(), poff, 1024); err != nil {
+			t.Fatalf("insert %d failed: %v", i, err)
+		}
+	}
+	tree.Close()
+}
+
+// xorshift64 is a pseudo-random number generator that matches the C implementation
+// exactly for fair workload comparison in benchmarks.
+type xorshift64 uint64
+
+func (x *xorshift64) next() uint64 {
+	*x ^= *x >> 12
+	*x ^= *x << 25
+	*x ^= *x >> 27
+	return uint64(*x) * 0x2545F4914F6CDD1D
+}
+
+// BenchmarkTreeInsert measures insertion performance with random operations.
+func BenchmarkTreeInsert(b *testing.B) {
+	state := xorshift64(42)
+
+	type op struct {
+		loff uint64
+		poff uint64
+		len  uint32
+	}
+
+	const numOps = 1000000
+	ops := make([]op, numOps)
+	maxLoff := uint64(0)
+
+	for i := range numOps {
+		var loff uint64
+		if maxLoff > 0 && (state.next()%10) < 5 {
+			loff = state.next() % maxLoff
+		} else {
+			loff = maxLoff
+		}
+		length := uint32((state.next() % 4096) + 1)
+		ops[i] = op{
+			loff: loff,
+			poff: state.next() % (1 << 40),
+			len:  length,
+		}
+		if loff+uint64(length) > maxLoff {
+			maxLoff = loff + uint64(length)
+		}
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		tree := NewTree(128 * 1024)
+		b.StartTimer()
+
+		for j := 0; j < numOps && i < b.N; j++ {
+			o := &ops[j]
+			tree.Insert(o.loff, o.poff, o.len)
+			i++
+		}
+		i--
+		tree.Close()
+	}
+}
+
+// BenchmarkTreeQuery measures query performance with random read operations.
+func BenchmarkTreeQuery(b *testing.B) {
+	const numOps = 1000000
+	state := xorshift64(42)
+
+	type op struct {
+		loff uint64
+		poff uint64
+		len  uint32
+	}
+
+	ops := make([]op, numOps)
+	maxLoff := uint64(0)
+
+	for i := range numOps {
+		var loff uint64
+		if maxLoff > 0 && (state.next()%10) < 5 {
+			loff = state.next() % maxLoff
+		} else {
+			loff = maxLoff
+		}
+		length := uint32((state.next() % 4096) + 1)
+		ops[i] = op{
+			loff: loff,
+			poff: state.next() % (1 << 40),
+			len:  length,
+		}
+		if loff+uint64(length) > maxLoff {
+			maxLoff = loff + uint64(length)
+		}
+	}
+
+	tree := NewTree(128 * 1024)
+	for i := range numOps {
+		tree.Insert(ops[i].loff, ops[i].poff, ops[i].len)
+	}
+
+	stateQ := xorshift64(4242)
+	qOffs := make([]uint64, numOps)
+	for i := range numOps {
+		qOffs[i] = stateQ.next() % maxLoff
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	var buf [16]QueryResult
+	for i := 0; i < b.N; i++ {
+		tree.Query(qOffs[i%numOps], 1024, buf[:])
+	}
+	tree.Close()
+}
+
+// BenchmarkTreeInsertAppend measures append-only insertion performance.
+func BenchmarkTreeInsertAppend(b *testing.B) {
+	const numOps = 1_000_000
+	state := xorshift64(42)
+
+	type op struct {
+		poff uint64
+		len  uint32
+	}
+	ops := make([]op, numOps)
+	for i := range numOps {
+		ops[i] = op{
+			poff: state.next() % (1 << 40),
+			len:  uint32(state.next()%4096) + 1,
+		}
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		tree := NewTree(128 * 1024)
+		b.StartTimer()
+		for j := 0; j < numOps && i < b.N; j++ {
+			tree.InsertAppend(ops[j].poff, ops[j].len)
+			i++
+		}
+		i--
+		tree.Close()
+	}
+}
+
+// BenchmarkTreeDelete measures deletion performance with random operations.
+func BenchmarkTreeDelete(b *testing.B) {
+	const numOps = 1_000_000
+
+	// Build deterministic append-only fill to get a large tree.
+	fillState := xorshift64(99)
+	type fillOp struct {
+		poff uint64
+		len  uint32
+	}
+	fills := make([]fillOp, numOps)
+	var maxLoff uint64
+	for i := range numOps {
+		fills[i] = fillOp{
+			poff: fillState.next() % (1 << 40),
+			len:  uint32(fillState.next()%4096) + 1,
+		}
+		maxLoff += uint64(fills[i].len)
+	}
+
+	// Pre-generate delete positions against the initial maxLoff.
+	delState := xorshift64(4242)
+	delOffs := make([]uint64, numOps)
+	for i := range numOps {
+		delOffs[i] = delState.next() % maxLoff
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		tree := NewTree(128 * 1024)
+		for _, f := range fills {
+			tree.InsertAppend(f.poff, f.len)
+		}
+		curMax := maxLoff
+		b.StartTimer()
+		for j := 0; j < numOps && i < b.N; j++ {
+			if curMax > 64 {
+				tree.Delete(delOffs[j]%(curMax-64), 64)
+				curMax -= 64
+			}
+			i++
+		}
+		i--
+		tree.Close()
+	}
+}
+
+// BenchmarkTreeSetTag measures tag assignment performance.
+func BenchmarkTreeSetTag(b *testing.B) {
+	const numOps = 1_000_000
+	state := xorshift64(42)
+
+	// Build tree with appends, recording each extent's starting loff.
+	tree := NewTree(128 * 1024)
+	loffs := make([]uint64, numOps)
+	var cur uint64
+	for i := range numOps {
+		loffs[i] = cur
+		l := uint32(state.next()%4096) + 1
+		tree.InsertAppend(state.next()%(1<<40), l)
+		cur += uint64(l)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		tree.SetTag(loffs[i%numOps], uint16(i))
+	}
+	tree.Close()
+}
+
+// BenchmarkTreeGetTag measures tag retrieval performance.
+func BenchmarkTreeGetTag(b *testing.B) {
+	const numOps = 1_000_000
+	state := xorshift64(42)
+
+	tree := NewTree(128 * 1024)
+	loffs := make([]uint64, numOps)
+	var cur uint64
+	for i := range numOps {
+		loffs[i] = cur
+		l := uint32(state.next()%4096) + 1
+		tree.InsertAppend(state.next()%(1<<40), l)
+		cur += uint64(l)
+	}
+	// Pre-set all tags so GetTag always succeeds.
+	for _, loff := range loffs {
+		tree.SetTag(loff, 0xBEEF)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		tree.GetTag(loffs[i%numOps])
+	}
+	tree.Close()
+}
+
+// BenchmarkCompareStandard compares Tree performance against a naive slice-based approach.
+func BenchmarkCompareStandard(b *testing.B) {
+	sizes := []int{1000, 10000, 100000}
+
+	for _, size := range sizes {
+		state := xorshift64(42)
+		type op struct {
+			loff uint64
+			poff uint64
+			len  uint32
+		}
+		ops := make([]op, size)
+		maxLoff := uint64(0)
+		for i := range size {
+			var loff uint64
+			if maxLoff > 0 && (state.next()%10) < 5 {
+				loff = state.next() % maxLoff
+			} else {
+				loff = maxLoff
+			}
+			length := uint32((state.next() % 4096) + 1)
+			ops[i] = op{loff: loff, poff: state.next() % (1 << 40), len: length}
+			if loff+uint64(length) > maxLoff {
+				maxLoff = loff + uint64(length)
+			}
+		}
+
+		b.Run(fmt.Sprintf("FlexTree-Insert-%d", size), func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				tree := NewTree(128 * 1024)
+				b.StartTimer()
+				for j := range size {
+					tree.Insert(ops[j].loff, ops[j].poff, ops[j].len)
+				}
+				b.StopTimer()
+				tree.Close()
+				b.StartTimer()
+			}
+		})
+
+		b.Run(fmt.Sprintf("Slice-Insert-%d", size), func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				var s []extent
+				for j := range size {
+					o := ops[j]
+					// Find position
+					idx, found := slices.BinarySearchFunc(s, o.loff, func(e extent, loff uint64) int {
+						if uint64(e.loff) <= loff {
+							if uint64(e.loff+e.len) > loff {
+								return 0
+							}
+							return -1
+						}
+						return 1
+					})
+
+					if found {
+						// This is a simplified "shifting insert" to match flextree behavior
+						e := &s[idx]
+						if uint64(e.loff) == o.loff {
+							s = slices.Insert(s, idx, extent{loff: uint32(o.loff), len: o.len, pTag: o.poff})
+						} else {
+							// Split
+							oldLen := e.len
+							so := uint32(o.loff - uint64(e.loff))
+							e.len = so
+							right := extent{loff: uint32(o.loff) + o.len, len: oldLen - so, pTag: (e.pTag & pOffMask) + uint64(so)}
+							s = slices.Insert(s, idx+1, extent{loff: uint32(o.loff), len: o.len, pTag: o.poff}, right)
+						}
+						for k := idx + 1; k < len(s); k++ {
+							if k == idx+1 && s[k].loff == uint32(o.loff) {
+								continue
+							}
+							s[k].loff += o.len
+						}
+					} else {
+						// Append or regular insert
+						s = slices.Insert(s, idx, extent{loff: uint32(o.loff), len: o.len, pTag: o.poff})
+						for k := idx + 1; k < len(s); k++ {
+							s[k].loff += o.len
+						}
+					}
+				}
+			}
+		})
+	}
 }
