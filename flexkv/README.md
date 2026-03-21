@@ -142,10 +142,16 @@ users.RegisterIndex("by_dept", deptIndexer)
 users.RegisterIndex("by_role", roleIndexer)
 
 // CRUD.
-users.Put([]byte("alice"), []byte("engineering,senior"))
-users.Put([]byte("bob"),   []byte("design,mid"))
+if err := users.Put([]byte("alice"), []byte("engineering,senior")); err != nil {
+    log.Fatal(err)
+}
+if err := users.Put([]byte("bob"), []byte("design,mid")); err != nil {
+    log.Fatal(err)
+}
 val, _ := users.Get([]byte("alice"))
-users.Delete([]byte("bob"))
+if err := users.Delete([]byte("bob")); err != nil {
+    log.Fatal(err)
+}
 
 // Primary key scan: all users.
 it := users.Scan(nil, nil)

@@ -83,8 +83,12 @@ if err != nil {
 }
 
 // Write.
-users.Put([]byte("alice"), []byte("engineer"))
-users.Put([]byte("bob"),   []byte("designer"))
+if err := users.Put([]byte("alice"), []byte("engineer")); err != nil {
+    log.Fatal(err)
+}
+if err := users.Put([]byte("bob"), []byte("designer")); err != nil {
+    log.Fatal(err)
+}
 
 // Read.
 val, _ := users.Get([]byte("alice"))

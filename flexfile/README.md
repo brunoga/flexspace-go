@@ -144,7 +144,7 @@ type Storage interface {
     SetTag(loff uint64, tag uint16) error
     IterateExtents(start, end uint64, fn func(loff uint64, tag uint16, data []byte) bool)
     Size() uint64
-    Sync()
+    Sync() error
     Close() error
 }
 ```

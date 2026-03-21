@@ -241,7 +241,7 @@ func (db *DB) Seq() uint64
 func (db *DB) Stats() DBStats
 
 // Sync forces a full flush of all pending writes to disk.
-func (db *DB) Sync()
+func (db *DB) Sync() error
 
 // Close flushes everything and releases resources.
 func (db *DB) Close() error
