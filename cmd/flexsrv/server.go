@@ -88,7 +88,7 @@ func (s *Server) table(name string) (*flexkv.Table, error) {
 	if ok {
 		return tbl, nil
 	}
-	tbl, err := s.table(name)
+	tbl, err := s.db.Table(name)
 	if err != nil {
 		return nil, err
 	}
