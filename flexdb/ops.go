@@ -5,13 +5,32 @@ import (
 	"errors"
 )
 
-// Put inserts or updates a key-value pair in the table.
+// Put inserts or updates a key-value pair in the table. Values larger than
+// MaxKVSize−len(key) bytes are stored in the per-table blob file; a 16-byte
+// sentinel is written to the main KV store in their place.
 // Caller must not hold any DB locks.
 func (ref *TableRef) Put(key, value []byte) error {
 	t := ref.table
 	db := t.db
-	if len(key) == 0 || len(key)+len(value) > MaxKVSize {
+	if len(key) == 0 || len(key) > MaxKVSize {
 		return errInvalidKV
+	}
+	if len(value) > MaxBlobSize {
+		return errBlobTooLarge
+	}
+
+	storeValue := value
+	if len(key)+len(value) > MaxKVSize && len(value) > 0 {
+		// Large value: write to the blob store first (with fdatasync), then
+		// store a sentinel in the memtable. The fdatasync ensures that if the
+		// sentinel reaches durable storage the blob bytes are already on disk.
+		offset, err := t.blobs.write(value)
+		if err != nil {
+			return err
+		}
+		sentinel := make([]byte, blobSentinelSize)
+		encodeBlobSentinel(sentinel, offset, uint32(len(value)))
+		storeValue = sentinel
 	}
 
 	pkey := makePrefixedKey(t.id, key)
@@ -23,24 +42,30 @@ func (ref *TableRef) Put(key, value []byte) error {
 
 	seq := db.seqNum.Add(1)
 	lockID := db.enterMT(h)
-	db.activeMT().put(pkey, value, seq)
+	db.activeMT().put(pkey, storeValue, seq)
 	db.exitMT(lockID)
 	return nil
 }
 
 // Get returns a copy of the value for key, or nil if not found.
+// For blob values the bytes are read from the blob file into a fresh slice.
 func (ref *TableRef) Get(key []byte) ([]byte, error) {
 	val, err := ref.GetView(key)
 	if err != nil || val == nil {
 		return nil, err
 	}
+	// GetView returns a view into the cache/memtable for inline values; copy
+	// it so the caller's slice is independent of internal mutable state.
+	// For blob values GetView already returns a fresh allocation, but we copy
+	// here too to maintain a uniform contract: Get always owns its result.
 	out := make([]byte, len(val))
 	copy(out, val)
 	return out, nil
 }
 
-// GetView returns a direct view of the value for key. The returned slice is
-// only valid until the next mutating operation on the DB.
+// GetView returns the value for key. For inline values the returned slice is
+// only valid until the next mutating operation on the DB. For blob values a
+// fresh allocation is always returned (identical behaviour to Get).
 func (ref *TableRef) GetView(key []byte) ([]byte, error) {
 	t := ref.table
 	db := t.db
@@ -57,7 +82,7 @@ func (ref *TableRef) GetView(key []byte) ([]byte, error) {
 			if len(val) == 0 {
 				return nil, nil // tombstone
 			}
-			return val, nil
+			return t.expandBlob(val)
 		}
 	} else {
 		db.exitMT(lockID)
@@ -71,7 +96,7 @@ func (ref *TableRef) GetView(key []byte) ([]byte, error) {
 			if len(val) == 0 {
 				return nil, nil
 			}
-			return val, nil
+			return t.expandBlob(val)
 		}
 	}
 
@@ -80,10 +105,10 @@ func (ref *TableRef) GetView(key []byte) ([]byte, error) {
 	lockID = t.enterFF(h2)
 	val := t.getPassthrough(key, ref.itvbuf, fp16(h2))
 	t.exitFF(lockID)
-	if val == nil || len(val) == 0 {
+	if len(val) == 0 {
 		return nil, nil
 	}
-	return val, nil
+	return t.expandBlob(val)
 }
 
 // Probe checks whether a key exists. Returns false for tombstones.
@@ -151,8 +176,11 @@ func (ref *TableRef) NewIterator() *Iterator {
 func (ref *TableRef) Update(key, oldValue, newValue []byte) (bool, error) {
 	t := ref.table
 	db := t.db
-	if len(key) == 0 {
+	if len(key) == 0 || len(key) > MaxKVSize {
 		return false, errInvalidKV
+	}
+	if len(newValue) > MaxBlobSize {
+		return false, errBlobTooLarge
 	}
 
 	pkey := makePrefixedKey(t.id, key)
@@ -169,37 +197,62 @@ func (ref *TableRef) Update(key, oldValue, newValue []byte) (bool, error) {
 	db.rwMT[lockID].Lock()
 	defer db.rwMT[lockID].Unlock()
 
-	// Read current value: active MT → immutable MT → flexfile.
-	var cur []byte
+	// Read current raw value: active MT → immutable MT → flexfile.
+	var rawCur []byte
 	found := false
 	if val, ok := db.activeMT().get(pkey); ok {
-		cur, found = val, true
+		rawCur, found = val, true
 	} else if val, ok := db.immutableMT().get(pkey); ok {
-		cur, found = val, true
+		rawCur, found = val, true
 	}
 	if found {
-		if len(cur) == 0 {
-			cur = nil // tombstone → treat as absent
+		if len(rawCur) == 0 {
+			rawCur = nil // tombstone → treat as absent
 		}
 	} else {
 		// Fall back to the flexfile (rwMT → rwFF: same order as the flush path).
 		h2 := hash32(key)
 		ffLockID := h2 & (lockShards - 1)
 		t.rwFF[ffLockID].RLock()
-		cur = t.getPassthrough(key, ref.itvbuf, fp16(h2))
+		rawCur = t.getPassthrough(key, ref.itvbuf, fp16(h2))
 		t.rwFF[ffLockID].RUnlock()
-		if len(cur) == 0 {
-			cur = nil
+		if len(rawCur) == 0 {
+			rawCur = nil
 		}
+	}
+
+	// Expand blob sentinel for comparison.
+	cur := rawCur
+	if cur != nil && isBlobSentinel(cur) {
+		expanded, err := t.expandBlob(cur)
+		if err != nil {
+			return false, err
+		}
+		cur = expanded
 	}
 
 	if !bytes.Equal(cur, oldValue) {
 		return false, nil
 	}
 
+	// Determine what to store for newValue.
+	storeValue := newValue
+	if len(key)+len(newValue) > MaxKVSize && len(newValue) > 0 {
+		offset, err := t.blobs.write(newValue)
+		if err != nil {
+			return false, err
+		}
+		sentinel := make([]byte, blobSentinelSize)
+		encodeBlobSentinel(sentinel, offset, uint32(len(newValue)))
+		storeValue = sentinel
+	}
+
 	seq := db.seqNum.Add(1)
-	db.activeMT().put(pkey, newValue, seq)
+	db.activeMT().put(pkey, storeValue, seq)
 	return true, nil
 }
 
-var errInvalidKV = errors.New("flexdb: invalid KV (empty key or size exceeds MaxKVSize)")
+var (
+	errInvalidKV   = errors.New("flexdb: invalid KV (empty key or key exceeds MaxKVSize)")
+	errBlobTooLarge = errors.New("flexdb: value exceeds MaxBlobSize")
+)

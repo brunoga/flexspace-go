@@ -640,3 +640,200 @@ func TestDropTable(t *testing.T) {
 		t.Error("data still present after DropTable")
 	}
 }
+
+// TestBlobPutGet exercises values that exceed MaxKVSize and are stored in the
+// per-table blob file.
+func TestBlobPutGet(t *testing.T) {
+	dir := tempDir(t)
+	db := mustOpenDB(t, dir)
+	defer db.Close()
+
+	tbl := mustTable(t, db, "blobs")
+	ref := tbl.NewRef()
+
+	// Build a value larger than MaxKVSize.
+	large := make([]byte, MaxKVSize+1)
+	for i := range large {
+		large[i] = byte(i)
+	}
+	key := []byte("bigkey")
+
+	if err := ref.Put(key, large); err != nil {
+		t.Fatalf("Put large: %v", err)
+	}
+
+	// Read back from the memtable (pre-flush).
+	got, err := ref.Get(key)
+	if err != nil {
+		t.Fatalf("Get (memtable): %v", err)
+	}
+	if string(got) != string(large) {
+		t.Errorf("Get (memtable): value mismatch (len %d vs %d)", len(got), len(large))
+	}
+
+	// Force flush to flexfile and read back from disk.
+	db.Sync()
+	got2, err := ref.Get(key)
+	if err != nil {
+		t.Fatalf("Get (disk): %v", err)
+	}
+	if string(got2) != string(large) {
+		t.Errorf("Get (disk): value mismatch (len %d vs %d)", len(got2), len(large))
+	}
+}
+
+// TestBlobReopen verifies that blob values survive a DB close/reopen cycle.
+func TestBlobReopen(t *testing.T) {
+	dir := tempDir(t)
+
+	large := make([]byte, MaxKVSize*2)
+	for i := range large {
+		large[i] = byte(i * 3)
+	}
+	key := []byte("persistent-blob")
+
+	// Write and close.
+	{
+		db := mustOpenDB(t, dir)
+		tbl := mustTable(t, db, "t")
+		if err := tbl.NewRef().Put(key, large); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+		db.Close()
+	}
+
+	// Reopen and verify.
+	{
+		db := mustOpenDB(t, dir)
+		defer db.Close()
+		tbl := mustTable(t, db, "t")
+		got, err := tbl.NewRef().Get(key)
+		if err != nil {
+			t.Fatalf("Get after reopen: %v", err)
+		}
+		if string(got) != string(large) {
+			t.Errorf("Get after reopen: value mismatch (len %d vs %d)", len(got), len(large))
+		}
+	}
+}
+
+// TestBlobIterator verifies that iterating over a table with blob values
+// transparently returns the full blob bytes.
+func TestBlobIterator(t *testing.T) {
+	dir := tempDir(t)
+	db := mustOpenDB(t, dir)
+	defer db.Close()
+
+	tbl := mustTable(t, db, "it")
+	ref := tbl.NewRef()
+
+	blobs := map[string][]byte{
+		"a": make([]byte, MaxKVSize+100),
+		"b": []byte("small"),
+		"c": make([]byte, MaxKVSize*3),
+	}
+	for i := range blobs["a"] {
+		blobs["a"][i] = byte(i)
+	}
+	for i := range blobs["c"] {
+		blobs["c"][i] = byte(i * 7)
+	}
+
+	for k, v := range blobs {
+		if err := ref.Put([]byte(k), v); err != nil {
+			t.Fatalf("Put %q: %v", k, err)
+		}
+	}
+	db.Sync()
+
+	it := ref.NewIterator()
+	defer it.Close()
+	it.Seek(nil)
+
+	seen := 0
+	for it.Valid() {
+		kv := it.Current()
+		want, ok := blobs[string(kv.Key)]
+		if !ok {
+			t.Errorf("unexpected key %q", kv.Key)
+		} else if string(kv.Value) != string(want) {
+			t.Errorf("key %q: value mismatch (len %d vs %d)", kv.Key, len(kv.Value), len(want))
+		}
+		seen++
+		it.Next()
+	}
+	if err := it.Err(); err != nil {
+		t.Fatalf("iterator error: %v", err)
+	}
+	if seen != len(blobs) {
+		t.Errorf("saw %d keys, want %d", seen, len(blobs))
+	}
+}
+
+// TestBlobDelete verifies that deleting a blob key works correctly.
+func TestBlobDelete(t *testing.T) {
+	dir := tempDir(t)
+	db := mustOpenDB(t, dir)
+	defer db.Close()
+
+	tbl := mustTable(t, db, "del")
+	ref := tbl.NewRef()
+
+	large := make([]byte, MaxKVSize+1)
+	key := []byte("toDelete")
+
+	if err := ref.Put(key, large); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := ref.Delete(key); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	db.Sync()
+
+	got, err := ref.Get(key)
+	if err != nil {
+		t.Fatalf("Get after delete: %v", err)
+	}
+	if got != nil {
+		t.Errorf("Get after delete: expected nil, got %d bytes", len(got))
+	}
+}
+
+// TestBlobBatch verifies that Batch.Commit correctly stores and retrieves
+// large values written as part of an atomic batch.
+func TestBlobBatch(t *testing.T) {
+	dir := tempDir(t)
+	db := mustOpenDB(t, dir)
+	defer db.Close()
+
+	tbl := mustTable(t, db, "batch")
+	ref := tbl.NewRef()
+
+	large := make([]byte, MaxKVSize+256)
+	for i := range large {
+		large[i] = byte(i * 5)
+	}
+
+	batch := db.NewBatch()
+	batch.Put(tbl, []byte("small"), []byte("tiny"))
+	batch.Put(tbl, []byte("large"), large)
+
+	ok, err := batch.Commit()
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if !ok {
+		t.Fatal("Commit returned false")
+	}
+
+	db.Sync()
+
+	got, err := ref.Get([]byte("large"))
+	if err != nil {
+		t.Fatalf("Get large: %v", err)
+	}
+	if string(got) != string(large) {
+		t.Errorf("large value mismatch (len %d vs %d)", len(got), len(large))
+	}
+}

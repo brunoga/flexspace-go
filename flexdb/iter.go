@@ -9,6 +9,10 @@ import (
 // (flushing) memtable, and the on-disk flexfile — using a 3-way merge.
 // Tombstones are suppressed. Memtable data takes precedence over file data.
 //
+// Blob values (values stored outside the main KV store) are transparently
+// expanded during iteration. If a blob read fails, iteration stops and the
+// error is available via Err().
+//
 // The iterator is scoped to one table: memtable keys are filtered by their
 // tableID prefix (first 4 bytes), which is stripped before keys are returned.
 // File keys are stored without a prefix (it is stripped at flush time).
@@ -18,12 +22,12 @@ type Iterator struct {
 	table *Table
 
 	// File iterator state (uses table.tree/cache directly; keys have no prefix).
-	fileNode   *treeNode
-	fileAncIdx int
-	fileKVIdx  int
-	fileShift  int64
-	fileCE     *cacheEntry
-	fileCP     *cachePartition
+	fileNode    *treeNode
+	fileAncIdx  int
+	fileKVIdx   int
+	fileShift   int64
+	fileCE      *cacheEntry
+	fileCP      *cachePartition
 	fileCurrent *KV
 
 	// Memtable iterators (index 0 = active, 1 = immutable).
@@ -34,6 +38,7 @@ type Iterator struct {
 	current   *KV
 	currentKV KV
 	valid     bool
+	err       error // set if a blob read fails; cleared on Seek
 
 	// tableIDBytes is the 4-byte big-endian tableID prefix for filtering.
 	tableIDBytes [4]byte
@@ -48,6 +53,7 @@ func (it *Iterator) Seek(key []byte) {
 	t := it.table
 	db := t.db
 	it.valid = false
+	it.err = nil
 	it.currentKV.Key = nil
 	it.currentKV.Value = nil
 
@@ -199,21 +205,37 @@ func (it *Iterator) advance() {
 			return
 		}
 
+		var rawValue []byte
 		switch minSrc {
 		case 0, 1: // memtable — strip the 4-byte tableID prefix
 			si := it.mtIters[minSrc]
 			it.currentKV.Key = si.Key()[4:]
-			it.currentKV.Value = si.Value()
+			rawValue = si.Value()
 		default: // file — keys already have no prefix
 			it.currentKV.Key = it.fileCurrent.Key
-			it.currentKV.Value = it.fileCurrent.Value
+			rawValue = it.fileCurrent.Value
 		}
 
 		it.skipKey(minKey)
 
-		if len(it.currentKV.Value) == 0 {
+		if len(rawValue) == 0 {
 			continue // tombstone
 		}
+
+		// Expand blob sentinel transparently.
+		if isBlobSentinel(rawValue) {
+			offset, size := decodeBlobSentinel(rawValue)
+			expanded, err := it.table.blobs.read(offset, size)
+			if err != nil {
+				it.err = err
+				it.valid = false
+				return
+			}
+			it.currentKV.Value = expanded
+		} else {
+			it.currentKV.Value = rawValue
+		}
+
 		it.valid = true
 		return
 	}
@@ -259,6 +281,11 @@ func (it *Iterator) skipKey(userKey []byte) {
 
 // Valid returns true when the iterator is at a valid key.
 func (it *Iterator) Valid() bool { return it.valid }
+
+// Err returns the first error encountered during iteration, if any.
+// A non-nil error indicates that iteration stopped early (e.g., a blob read
+// failed). Always check Err after a loop that exits because Valid() is false.
+func (it *Iterator) Err() error { return it.err }
 
 // Current returns the current KV (user key, no tableID prefix). Valid only when Valid()==true.
 func (it *Iterator) Current() *KV { return it.current }

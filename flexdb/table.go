@@ -20,6 +20,7 @@ type Table struct {
 	ff    Storage
 	tree  *dbTree
 	cache *dbCache
+	blobs *blobStore // append-only blob file for values exceeding MaxKVSize
 
 	// Per-table flexfile read-write locks (16 shards).
 	rwFF [lockShards]sync.RWMutex
@@ -62,11 +63,17 @@ func (db *DB) openTable(id uint32, name string) (*Table, error) {
 	if err != nil {
 		return nil, fmt.Errorf("openTable %q: flexfile: %w", name, err)
 	}
+	blobs, err := openBlobStore(dir)
+	if err != nil {
+		ff.Close()
+		return nil, fmt.Errorf("openTable %q: blobstore: %w", name, err)
+	}
 	t := &Table{
 		db:     db,
 		id:     id,
 		name:   name,
 		ff:     ff,
+		blobs:  blobs,
 		kvbuf:  make([]byte, MaxKVSize*2),
 		itvbuf: make([]byte, (sparseInterval*MaxKVSize)+MaxKVSize),
 	}
@@ -76,11 +83,13 @@ func (db *DB) openTable(id uint32, name string) (*Table, error) {
 	if ff.Size() == 0 {
 		if err := t.initSentinel(); err != nil {
 			ff.Close()
+			blobs.close()
 			return nil, fmt.Errorf("openTable %q: init sentinel: %w", name, err)
 		}
 	} else {
 		if err := t.rebuildIndex(); err != nil {
 			ff.Close()
+			blobs.close()
 			return nil, fmt.Errorf("openTable %q: rebuild index: %w", name, err)
 		}
 	}
@@ -88,7 +97,23 @@ func (db *DB) openTable(id uint32, name string) (*Table, error) {
 }
 
 func (t *Table) close() error {
-	return t.ff.Close()
+	blobErr := t.blobs.close()
+	ffErr := t.ff.Close()
+	if blobErr != nil {
+		return blobErr
+	}
+	return ffErr
+}
+
+// expandBlob dereferences val if it is a blob sentinel, returning the actual
+// blob bytes. For inline values, val is returned unchanged. An I/O error is
+// returned only when dereferencing a sentinel fails.
+func (t *Table) expandBlob(val []byte) ([]byte, error) {
+	if !isBlobSentinel(val) {
+		return val, nil
+	}
+	offset, size := decodeBlobSentinel(val)
+	return t.blobs.read(offset, size)
 }
 
 // TableStats holds statistics for a single flexdb table.

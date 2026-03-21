@@ -7,7 +7,10 @@ import (
 
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
-// MaxKVSize is the maximum allowed size of a single KV entry (4KB).
+// MaxKVSize is the maximum combined key+value size for inline storage (4 KiB).
+// Entries that exceed this limit are automatically stored as blobs: the value
+// is written to a per-table append-only blob file and a 16-byte sentinel is
+// kept in the main KV store. Keys alone are always ≤ MaxKVSize.
 const MaxKVSize = 4 << 10
 
 // KV represents a key-value pair. A zero-length Value is a tombstone (deletion).

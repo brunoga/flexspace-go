@@ -220,6 +220,7 @@ func (db *DB) Sync() {
 	db.tablesMu.RLock()
 	for _, t := range db.tablesByID {
 		t.ff.Sync()
+		t.blobs.sync()
 	}
 	db.tablesMu.RUnlock()
 }
@@ -284,6 +285,7 @@ func (db *DB) swapAndFlush() {
 	db.tablesMu.RLock()
 	for _, t := range db.tablesByID {
 		t.ff.Sync()
+		t.blobs.sync()
 	}
 	db.tablesMu.RUnlock()
 

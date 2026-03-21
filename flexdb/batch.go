@@ -76,8 +76,29 @@ func (b *Batch) Commit() (bool, error) {
 
 	// Validate all ops before touching shared state.
 	for _, op := range b.ops {
-		if len(op.key) == 0 || len(op.key)+len(op.value) > MaxKVSize {
+		if len(op.key) == 0 || len(op.key) > MaxKVSize {
 			return false, errInvalidKV
+		}
+		if len(op.value) > MaxBlobSize {
+			return false, errBlobTooLarge
+		}
+	}
+
+	// Write blob values to the blob store before acquiring any locks.
+	// Large values are replaced with their 16-byte sentinels in b.ops so that
+	// the WAL record and skip-list entries only ever hold small sentinels.
+	// Blob writes are fdatasynced inside blobs.write, ensuring that if the
+	// sentinel reaches the WAL the blob bytes are already on disk.
+	for i := range b.ops {
+		op := &b.ops[i]
+		if len(op.key)+len(op.value) > MaxKVSize && len(op.value) > 0 {
+			offset, err := op.table.blobs.write(op.value)
+			if err != nil {
+				return false, err
+			}
+			sentinel := make([]byte, blobSentinelSize)
+			encodeBlobSentinel(sentinel, offset, uint32(len(op.value)))
+			op.value = sentinel
 		}
 	}
 
@@ -107,7 +128,10 @@ func (b *Batch) Commit() (bool, error) {
 	// Evaluate conditions. Reads under the write locks are safe: no swap can
 	// occur while we hold all 16 locks, so the active MT is stable.
 	for _, chk := range b.checks {
-		cur := b.readCurrent(chk.table, chk.key)
+		cur, err := b.readCurrent(chk.table, chk.key)
+		if err != nil {
+			return false, err
+		}
 		if !bytes.Equal(cur, chk.expected) {
 			return false, nil
 		}
@@ -131,24 +155,25 @@ func (b *Batch) Commit() (bool, error) {
 
 // readCurrent reads the current value of key in table, checking active MT →
 // immutable MT → flexfile. Must be called while holding all rwMT write locks.
-// Returns nil if the key is absent or has a tombstone.
-func (b *Batch) readCurrent(table *Table, key []byte) []byte {
+// Returns (nil, nil) if the key is absent or has a tombstone. Blob sentinels
+// are expanded so that callers compare against actual blob bytes.
+func (b *Batch) readCurrent(table *Table, key []byte) ([]byte, error) {
 	db := b.db
 	pkey := makePrefixedKey(table.id, key)
 
 	// Active memtable (hidden cannot be true: we hold all write locks).
 	if val, ok := db.activeMT().get(pkey); ok {
 		if len(val) == 0 {
-			return nil // tombstone
+			return nil, nil // tombstone
 		}
-		return val
+		return table.expandBlob(val)
 	}
 	// Immutable memtable (also stable: swap requires all write locks).
 	if val, ok := db.immutableMT().get(pkey); ok {
 		if len(val) == 0 {
-			return nil
+			return nil, nil
 		}
-		return val
+		return table.expandBlob(val)
 	}
 	// Flexfile (lock order: rwMT → rwFF, same as the flush path).
 	h := hash32(key)
@@ -157,7 +182,7 @@ func (b *Batch) readCurrent(table *Table, key []byte) []byte {
 	val := table.getPassthrough(key, table.itvbuf, fp16(h))
 	table.rwFF[ffLockID].RUnlock()
 	if len(val) == 0 {
-		return nil
+		return nil, nil
 	}
-	return val
+	return table.expandBlob(val)
 }
