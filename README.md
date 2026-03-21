@@ -45,6 +45,20 @@ The Go implementation improves on the C original in several ways:
 - **Sequence numbers** — every committed write increments a global counter persisted in the WAL; useful for change-data-capture, MVCC extensions, and conflict detection.
 - **No dependencies** — pure Go standard library only.
 - **Interactive CLI** (`flexctl`) — REPL, schema management, JSON import/export, batch operations.
+- **Large-value (blob) support** — values above the inline threshold are stored transparently as blobs; no API change required.
+
+---
+
+## Size Limits
+
+| What | Limit | Notes |
+|---|---|---|
+| Inline key + value | 4 KiB | Combined size; fits in a single flexfile extent. |
+| Blob value | 1 GiB | Stored out-of-line when key+value exceeds 4 KiB; transparent to callers. |
+| Key | < 4 KiB | A key alone must fit in the inline threshold. |
+| flexsrv `max_value_bytes` | 64 MiB default | Server-side cap on values accepted or served; overridable in `config.json`. Must not exceed 1 GiB. |
+
+Values whose combined key+value size fits within 4 KiB are stored inline in the main table file. Larger values are automatically written to a per-table blob file and replaced by a 16-byte sentinel in the main file — the process is transparent to all `flexdb`, `flexkv`, `flexctl`, and `flexsrv` callers.
 
 ---
 

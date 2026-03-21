@@ -39,7 +39,7 @@ EOF
 # 3. Start the server (auto-generates a self-signed TLS cert for dev)
 ./flexsrv serve --config config.json
 # time=... level=WARN  msg="using auto-generated self-signed certificate — not for production"
-# time=... level=INFO  msg="flexsrv starting" version=0.0.1 pid=... db=/data/mydb addr=https://0.0.0.0:7700 tls=self-signed auth_keys=1 tables=0 max_scan_results=10000 max_value_bytes=4096 log_level=info
+# time=... level=INFO  msg="flexsrv starting" version=0.0.1 pid=... db=/data/mydb addr=https://0.0.0.0:7700 tls=self-signed auth_keys=1 tables=0 max_scan_results=10000 max_value_bytes=67108864 log_level=info
 # time=... level=INFO  msg="ready"
 
 # 4. Test with curl
@@ -75,7 +75,7 @@ All settings can be provided via a JSON config file and overridden with CLI flag
 
   "limits": {
     "max_scan_results": 10000,
-    "max_value_bytes":  4096
+    "max_value_bytes":  67108864
   }
 }
 ```
@@ -555,5 +555,5 @@ See the [flexctl README](../flexctl/README.md#remote-mode--connecting-to-flexsrv
 - Run behind a reverse proxy (nginx, Caddy) if you need HTTP/2 push, path-based routing, or certificate automation via ACME.
 - Use a `read`-role key for read-only application traffic and an `admin`-role key only for administration.
 - flexsrv opens the database exclusively — only one flexsrv process should access a given database directory at a time. (flexctl in local mode will conflict with a running flexsrv on the same path.)
-- `max_value_bytes` defaults to 4096, matching the flexkv `MaxKVSize` limit. Raising it in config has no effect without a corresponding change to the storage layer.
+- `max_value_bytes` defaults to 67108864 (64 MiB). Values larger than the inline threshold (4 KiB combined key+value) are stored as blobs transparently; `max_value_bytes` caps the maximum blob size the server will accept and serve. The storage layer supports blobs up to 1 GiB.
 - Graceful shutdown drains in-flight requests for up to 15 seconds on `SIGINT`/`SIGTERM`.

@@ -27,7 +27,7 @@ import (
 //	  },
 //	  "limits": {
 //	    "max_scan_results": 10000,
-//	    "max_value_bytes":  4096
+//	    "max_value_bytes":  67108864
 //	  }
 //	}
 type Config struct {
@@ -68,7 +68,7 @@ type APIKeyConfig struct {
 // Limits caps resource usage per request.
 type Limits struct {
 	MaxScanResults int `json:"max_scan_results"` // default 10 000
-	MaxValueBytes  int `json:"max_value_bytes"`  // default 4 096
+	MaxValueBytes  int `json:"max_value_bytes"`  // default 64 MiB; storage layer cap is 1 GiB
 }
 
 // loadConfig parses the JSON config file at path. An empty path returns
@@ -77,7 +77,7 @@ func loadConfig(path string) (*Config, error) {
 	cfg := &Config{
 		Limits: Limits{
 			MaxScanResults: 10_000,
-			MaxValueBytes:  4_096,
+			MaxValueBytes:  64 << 20, // 64 MiB
 		},
 	}
 	if path == "" {
@@ -95,7 +95,7 @@ func loadConfig(path string) (*Config, error) {
 		cfg.Limits.MaxScanResults = 10_000
 	}
 	if cfg.Limits.MaxValueBytes <= 0 {
-		cfg.Limits.MaxValueBytes = 4_096
+		cfg.Limits.MaxValueBytes = 64 << 20
 	}
 	return cfg, nil
 }

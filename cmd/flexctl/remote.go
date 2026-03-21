@@ -26,6 +26,13 @@ import (
 	"time"
 )
 
+// ndjsonScannerMax is the maximum NDJSON line length accepted by remote
+// scan/dump scanners. Sized to handle a base64-encoded value at the
+// server's default max_value_bytes (64 MiB) plus a small JSON envelope.
+// bufio.Scanner starts with a 4 KiB buffer and grows to this limit only
+// when a line actually requires it.
+const ndjsonScannerMax = (64<<20)*4/3 + 1024 // ~86 MiB
+
 // RemoteClient holds an HTTP client configured for one flexsrv instance.
 type RemoteClient struct {
 	base string       // e.g. "https://host:7700"
@@ -233,7 +240,9 @@ func (rc *RemoteClient) Scan(table string, start, end []byte, limit int) *remote
 	}
 	path := "/tables/" + url.PathEscape(table) + "/scan?" + q.Encode()
 	resp := rc.doStream(path)
-	it := &remoteScanIter{resp: resp, scanner: bufio.NewScanner(resp.Body)}
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(nil, ndjsonScannerMax)
+	it := &remoteScanIter{resp: resp, scanner: sc}
 	it.advance()
 	return it
 }
@@ -245,7 +254,9 @@ func (rc *RemoteClient) ScanPrefix(table string, prefix []byte, limit int) *remo
 	}
 	path := "/tables/" + url.PathEscape(table) + "/scan?" + q.Encode()
 	resp := rc.doStream(path)
-	it := &remoteScanIter{resp: resp, scanner: bufio.NewScanner(resp.Body)}
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(nil, ndjsonScannerMax)
+	it := &remoteScanIter{resp: resp, scanner: sc}
 	it.advance()
 	return it
 }
@@ -320,7 +331,9 @@ func (rc *RemoteClient) indexScan(table, index string, q url.Values) *remoteInde
 		"/indexes/" + url.PathEscape(index) +
 		"/scan?" + q.Encode()
 	resp := rc.doStream(path)
-	it := &remoteIndexIter{resp: resp, scanner: bufio.NewScanner(resp.Body)}
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(nil, ndjsonScannerMax)
+	it := &remoteIndexIter{resp: resp, scanner: sc}
 	it.advance()
 	return it
 }
@@ -425,7 +438,10 @@ func (rc *RemoteClient) DumpData(w io.Writer) {
 	var curTable *DumpTable
 
 	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 256*1024), 256*1024)
+	// Each NDJSON line holds a base64-encoded value (4/3 overhead) plus JSON envelope.
+	// Sized to match the server's default max_value_bytes (64 MiB). Start small,
+	// grow as needed.
+	scanner.Buffer(nil, ndjsonScannerMax)
 	for scanner.Scan() {
 		var line struct {
 			Type  string `json:"type"`

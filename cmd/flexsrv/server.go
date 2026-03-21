@@ -1050,7 +1050,9 @@ func (s *Server) handleLoadData(w http.ResponseWriter, r *http.Request) {
 	)
 
 	scanner := bufio.NewScanner(r.Body)
-	scanner.Buffer(make([]byte, 1<<20), 1<<20) // 1 MiB line buffer
+	// Each NDJSON line holds a base64-encoded value (4/3 overhead) plus JSON envelope.
+	// Start with a small buffer and let it grow up to the configured limit.
+	scanner.Buffer(nil, s.cfg.Limits.MaxValueBytes*4/3+1024)
 	for scanner.Scan() {
 		var l line
 		if err := json.Unmarshal(scanner.Bytes(), &l); err != nil {
