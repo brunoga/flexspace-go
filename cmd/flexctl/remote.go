@@ -217,6 +217,7 @@ type remoteScanIter struct {
 	key     []byte
 	val     []byte
 	valid   bool
+	err     error
 }
 
 func (rc *RemoteClient) Scan(table string, start, end []byte, limit int) *remoteScanIter {
@@ -252,6 +253,7 @@ func (rc *RemoteClient) ScanPrefix(table string, prefix []byte, limit int) *remo
 func (it *remoteScanIter) advance() {
 	if !it.scanner.Scan() {
 		it.valid = false
+		it.err = it.scanner.Err()
 		return
 	}
 	var row struct {
@@ -276,6 +278,7 @@ func (it *remoteScanIter) Valid() bool   { return it.valid }
 func (it *remoteScanIter) Next()         { it.advance() }
 func (it *remoteScanIter) Key() []byte   { return it.key }
 func (it *remoteScanIter) Value() []byte { return it.val }
+func (it *remoteScanIter) Err() error    { return it.err }
 func (it *remoteScanIter) Close()        { it.resp.Body.Close() }
 
 // ---- index ops --------------------------------------------------------------
@@ -308,6 +311,7 @@ type remoteIndexIter struct {
 	pk      []byte
 	record  []byte
 	valid   bool
+	err     error
 }
 
 func (rc *RemoteClient) indexScan(table, index string, q url.Values) *remoteIndexIter {
@@ -347,6 +351,7 @@ func (rc *RemoteClient) IndexScanPrefix(table, index string, prefix []byte, limi
 func (it *remoteIndexIter) advance() {
 	if !it.scanner.Scan() {
 		it.valid = false
+		it.err = it.scanner.Err()
 		return
 	}
 	var row struct {
@@ -374,6 +379,7 @@ func (it *remoteIndexIter) Next()                          { it.advance() }
 func (it *remoteIndexIter) Value() []byte                  { return it.idxVal }
 func (it *remoteIndexIter) PrimaryKey() []byte             { return it.pk }
 func (it *remoteIndexIter) GetRecord() ([]byte, error)     { return it.record, nil }
+func (it *remoteIndexIter) Err() error                     { return it.err }
 func (it *remoteIndexIter) Close()                         { it.resp.Body.Close() }
 
 // ---- batch ------------------------------------------------------------------
@@ -447,6 +453,9 @@ func (rc *RemoteClient) DumpData(w io.Writer) {
 				Value: string(val),
 			})
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "flexctl: dump stream error: %v\n", err)
 	}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")

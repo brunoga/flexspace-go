@@ -33,7 +33,7 @@ type Storage interface {
 	Size() uint64
 
 	// Sync flushes all pending writes to durable storage.
-	Sync()
+	Sync() error
 
 	// Close releases all resources held by the store.
 	Close() error

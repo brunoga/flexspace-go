@@ -219,17 +219,22 @@ func (db *DB) Close() error {
 }
 
 func (db *DB) closeAll() error {
+	var firstErr error
 	for _, mt := range db.memtables {
 		if mt != nil {
-			mt.close()
+			if err := mt.close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	db.tablesMu.RLock()
 	defer db.tablesMu.RUnlock()
 	for _, t := range db.tablesByID {
-		t.ff.Close()
+		if err := t.ff.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
-	return nil
+	return firstErr
 }
 
 // Sync forces a full flush of all pending writes to the flexfiles.
@@ -242,7 +247,9 @@ func (db *DB) Sync() error {
 	db.flushActiveMT()
 	db.tablesMu.RLock()
 	for _, t := range db.tablesByID {
-		t.ff.Sync()
+		if err := t.ff.Sync(); err != nil {
+			db.setFlushErr(err)
+		}
 		t.blobs.sync()
 	}
 	db.tablesMu.RUnlock()
@@ -321,7 +328,9 @@ func (db *DB) swapAndFlush() {
 	} else {
 		db.tablesMu.RLock()
 		for _, t := range db.tablesByID {
-			t.ff.Sync()
+			if err := t.ff.Sync(); err != nil {
+				db.setFlushErr(err)
+			}
 			t.blobs.sync()
 		}
 		db.tablesMu.RUnlock()

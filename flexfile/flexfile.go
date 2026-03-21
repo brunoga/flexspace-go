@@ -139,7 +139,10 @@ func Open(path string) (*FlexFile, error) {
 	}
 
 	ff.bm = newBlockManager(ff)
-	ff.bm.init(tree)
+	if err := ff.bm.init(tree); err != nil {
+		ff.Close()
+		return nil, fmt.Errorf("init block manager: %w", err)
+	}
 
 	return ff, nil
 }
@@ -235,76 +238,86 @@ func (ff *FlexFile) redoLog() error {
 		return fmt.Errorf("failed to sync tree after redo: %w", err)
 	}
 
-	ff.logFile.Truncate(0)
+	if err := ff.logFile.Truncate(0); err != nil {
+		return fmt.Errorf("truncate log after redo: %w", err)
+	}
 	ff.logTotalSize = 0
 	return nil
 }
 
 // Close flushes all pending data and releases resources.
 func (ff *FlexFile) Close() error {
-	ff.Sync()
+	syncErr := ff.Sync()
 	// Always sync tree on close so crash recovery finds a valid tree + empty log.
 	if ff.logTotalSize > 0 {
 		treeMetaPath := filepath.Join(ff.path, "FLEXTREE_META")
 		treeNodePath := filepath.Join(ff.path, "FLEXTREE_NODE")
 		ff.tree.Sync(treeMetaPath, treeNodePath)
-		ff.logFile.Truncate(0)
+		_ = ff.logFile.Truncate(0) // best-effort; Close() releases the fd regardless
 	}
-	ff.bm.close()
+	_ = ff.bm.close() // already flushed by Sync(); ignore duplicate-flush error
 	for i, chunk := range ff.chunks {
 		syscall.Munmap(chunk)
 		delete(ff.chunks, i)
 	}
-	if err := ff.dataFile.Close(); err != nil {
-		return err
+	dataErr := ff.dataFile.Close()
+	logErr := ff.logFile.Close()
+	if syncErr != nil {
+		return syncErr
 	}
-	if err := ff.logFile.Close(); err != nil {
-		return err
+	if dataErr != nil {
+		return dataErr
 	}
-	return nil
+	return logErr
 }
 
 // Sync flushes pending data to disk.
 // Uses fdatasync to match C flexfile_sync_r. The tree is checkpointed to disk
 // once the WAL exceeds logMaxSize.
-func (ff *FlexFile) Sync() {
+func (ff *FlexFile) Sync() error {
 	atomic.AddUint64(&syncCount, 1)
-	ff.bm.flush()
+	if err := ff.bm.flush(); err != nil {
+		return err
+	}
 	// Use fdatasync (syscall 187 on macOS) — faster than F_FULLFSYNC and
 	// sufficient for our durability guarantee (data already written via mmap).
 	syscall.Syscall(syscall.SYS_FDATASYNC, ff.dataFile.Fd(), 0, 0)
-	ff.syncLog()
+	if err := ff.syncLog(); err != nil {
+		return err
+	}
 
 	if ff.logTotalSize >= logMaxSize {
 		treeMetaPath := filepath.Join(ff.path, "FLEXTREE_META")
 		treeNodePath := filepath.Join(ff.path, "FLEXTREE_NODE")
 		ff.tree.Sync(treeMetaPath, treeNodePath)
-		ff.logFile.Truncate(0)
+		_ = ff.logFile.Truncate(0) // best-effort; log will be replayed and re-truncated on next open
 		ff.logTotalSize = 0
 	}
+	return nil
 }
 
-func (ff *FlexFile) syncLog() {
+func (ff *FlexFile) syncLog() error {
 	if ff.logBufSize == 0 {
-		return
+		return nil
 	}
 	n, err := ff.logFile.WriteAt(ff.logBuf[:ff.logBufSize], int64(ff.logTotalSize))
 	if err != nil {
-		panic(fmt.Sprintf("log write failed: %v", err))
+		return fmt.Errorf("flexfile: log write failed: %w", err)
 	}
 	ff.logTotalSize += uint64(n)
 	ff.logBufSize = 0
 	syscall.Syscall(syscall.SYS_FDATASYNC, ff.logFile.Fd(), 0, 0)
+	return nil
 }
 
 // flushLogIfFull writes the in-memory log buffer to disk when it is full.
 // Unlike Sync(), this does NOT fdatasync the data file — matching C's behavior
 // where log flushes are independent of data persistence.
-func (ff *FlexFile) flushLogIfFull() {
+func (ff *FlexFile) flushLogIfFull() error {
 	if ff.logBufSize < logMemCap {
-		return
+		return nil
 	}
-	ff.syncLog()
+	return ff.syncLog()
 }
 
 func (ff *FlexFile) logWrite(o op, p1, p2 uint64, p3 uint32) {
@@ -378,7 +391,9 @@ func (ff *FlexFile) Insert(buf []byte, loff uint64) (int, error) {
 		// If the data won't fit in the remaining space of the current block,
 		// advance to a fresh block so this write is always a single extent.
 		if int(blockSize-cb.off) < len(buf) {
-			bm.nextBlock()
+			if err := bm.nextBlock(); err != nil {
+				return 0, err
+			}
 			cb = bm.currentBuf
 		}
 		poff := cb.blkID*blockSize + cb.off
@@ -390,7 +405,9 @@ func (ff *FlexFile) Insert(buf []byte, loff uint64) (int, error) {
 		bm.usage[cb.blkID] += uint32(n)
 		cb.off += uint64(n)
 		if cb.off == blockSize {
-			bm.nextBlock()
+			if err := bm.nextBlock(); err != nil {
+				return 0, err
+			}
 		}
 
 		err := ff.tree.InsertAppend(poff, uint32(n))
@@ -410,7 +427,9 @@ func (ff *FlexFile) Insert(buf []byte, loff uint64) (int, error) {
 		ff.logBufSize += logEntrySize
 
 		if ff.logBufSize >= logMemCap {
-			ff.flushLogIfFull()
+			if err := ff.flushLogIfFull(); err != nil {
+				return n, err
+			}
 		}
 		return n, nil
 	}
@@ -427,12 +446,15 @@ func (ff *FlexFile) insertR(buf []byte, loff uint64, commit bool) (int, error) {
 	remaining := len(buf)
 	for remaining > 0 {
 		poff := ff.bm.offset()
-		n := ff.bm.write(buf[bytesInserted:])
+		n, err := ff.bm.write(buf[bytesInserted:])
+		if err != nil {
+			return bytesInserted, err
+		}
 		if n == 0 {
 			return bytesInserted, fmt.Errorf("block manager write failed")
 		}
 
-		err := ff.tree.InsertWithTag(loff+uint64(bytesInserted), poff, uint32(n), 0)
+		err = ff.tree.InsertWithTag(loff+uint64(bytesInserted), poff, uint32(n), 0)
 		if err != nil {
 			return bytesInserted, err
 		}
@@ -443,7 +465,9 @@ func (ff *FlexFile) insertR(buf []byte, loff uint64, commit bool) (int, error) {
 	}
 
 	if commit && ff.logBufSize >= logMemCap {
-		ff.flushLogIfFull()
+		if err := ff.flushLogIfFull(); err != nil {
+			return bytesInserted, err
+		}
 	}
 
 	return bytesInserted, nil
@@ -474,7 +498,9 @@ func (ff *FlexFile) collapseR(loff, length uint64, commit bool) error {
 	}
 
 	if commit && ff.logBufSize >= logMemCap {
-		ff.flushLogIfFull()
+		if err := ff.flushLogIfFull(); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -524,7 +550,9 @@ func (ff *FlexFile) Update(buf []byte, loff, olen uint64) (int, error) {
 	}
 
 	if ff.logBufSize >= logMemCap {
-		ff.flushLogIfFull()
+		if err := ff.flushLogIfFull(); err != nil {
+			return n, err
+		}
 	}
 
 	return n, nil
@@ -544,7 +572,9 @@ func (ff *FlexFile) setTagR(loff uint64, tag uint16, commit bool) error {
 	ff.logWrite(opSetTag, loff, uint64(tag), 0)
 
 	if commit && ff.logBufSize >= logMemCap {
-		ff.flushLogIfFull()
+		if err := ff.flushLogIfFull(); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -603,9 +633,9 @@ func (ff *FlexFile) GC() {
 			}
 
 			newPoff := ff.bm.offset()
-			n = ff.bm.write(buf)
-			if uint32(n) != length {
-				return true
+			n, err = ff.bm.write(buf)
+			if err != nil || uint32(n) != length {
+				return true // GC is best-effort; skip extents that can't be rewritten
 			}
 
 			ff.tree.UpdatePoff(loff, newPoff, length)
@@ -668,12 +698,12 @@ func newBlockManager(ff *FlexFile) *blockManager {
 	}
 }
 
-func (bm *blockManager) close() {
-	bm.flush()
+func (bm *blockManager) close() error {
+	return bm.flush()
 }
 
 // init initializes block-usage state by scanning the extent tree.
-func (bm *blockManager) init(tree *flextree.Tree) {
+func (bm *blockManager) init(tree *flextree.Tree) error {
 	tree.IterateExtents(func(loff, poff uint64, length uint32, tag uint16) bool {
 		p := poff
 		l := uint64(length)
@@ -688,24 +718,29 @@ func (bm *blockManager) init(tree *flextree.Tree) {
 		return true
 	})
 	bm.freeBlocksHint = 0
-	bm.currentBuf.blkID = bm.findEmptyBlock()
+	blkID, err := bm.findEmptyBlock()
+	if err != nil {
+		return err
+	}
+	bm.currentBuf.blkID = blkID
 	bm.currentBuf.off = 0
+	return nil
 }
 
-func (bm *blockManager) findEmptyBlock() uint64 {
+func (bm *blockManager) findEmptyBlock() (uint64, error) {
 	for i := bm.freeBlocksHint; i < blockCount; i++ {
 		if bm.usage[i] == 0 {
 			bm.freeBlocksHint = i
-			return i
+			return i, nil
 		}
 	}
 	for i := uint64(0); i < bm.freeBlocksHint; i++ {
 		if bm.usage[i] == 0 {
 			bm.freeBlocksHint = i
-			return i
+			return i, nil
 		}
 	}
-	panic("no empty blocks")
+	return 0, fmt.Errorf("flexfile: no free blocks (storage capacity exceeded)")
 }
 
 // updateUsage adjusts the byte-usage counter for blkID by delta.
@@ -729,7 +764,7 @@ func (bm *blockManager) offset() uint64 {
 }
 
 // write copies up to one block's worth of buf into the current block buffer.
-func (bm *blockManager) write(buf []byte) int {
+func (bm *blockManager) write(buf []byte) (int, error) {
 	n := len(buf)
 	remain := int(blockSize - bm.currentBuf.off)
 	if n > remain {
@@ -745,30 +780,38 @@ func (bm *blockManager) write(buf []byte) int {
 	bm.currentBuf.off += uint64(n)
 
 	if bm.currentBuf.off == blockSize {
-		bm.nextBlock()
+		if err := bm.nextBlock(); err != nil {
+			return n, err
+		}
 	}
 
-	return n
+	return n, nil
 }
 
 // nextBlock flushes the current block synchronously and moves to the next one.
-func (bm *blockManager) nextBlock() {
+func (bm *blockManager) nextBlock() error {
 	if bm.currentBuf.off > 0 {
 		atomic.AddUint64(&writeCount, 1)
 		_, err := bm.ff.dataFile.WriteAt(bm.currentBuf.data[:bm.currentBuf.off], int64(bm.currentBuf.blkID*blockSize))
 		if err != nil {
-			panic(fmt.Sprintf("block write failed: %v", err))
+			return fmt.Errorf("flexfile: block write failed: %w", err)
 		}
 	}
-	bm.currentBuf.blkID = bm.findEmptyBlock()
+	blkID, err := bm.findEmptyBlock()
+	if err != nil {
+		return err
+	}
+	bm.currentBuf.blkID = blkID
 	bm.currentBuf.off = 0
+	return nil
 }
 
 // flush ensures the current block buffer is written to disk.
-func (bm *blockManager) flush() {
+func (bm *blockManager) flush() error {
 	if bm.currentBuf.off > 0 {
-		bm.nextBlock()
+		return bm.nextBlock()
 	}
+	return nil
 }
 
 // read attempts to serve buf from the current in-memory block buffer.

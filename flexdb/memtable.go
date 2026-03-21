@@ -47,8 +47,12 @@ func newMemtable(db *DB, logPath string) (*memtable, error) {
 }
 
 func (mt *memtable) close() error {
-	mt.flushLog()
-	return mt.logFd.Close()
+	flushErr := mt.flushLog()
+	closeErr := mt.logFd.Close()
+	if flushErr != nil {
+		return flushErr
+	}
+	return closeErr
 }
 
 // put upserts a KV into the memtable and appends it to the WAL.
@@ -193,7 +197,9 @@ func (mt *memtable) flushLogLocked() error {
 // The seq is persisted so that DB.seqNum can be restored after a reopen
 // even when the WAL body has been truncated (i.e. all data was flushed).
 func (mt *memtable) truncateLog() error {
-	mt.flushLog()
+	if err := mt.flushLog(); err != nil {
+		return err
+	}
 	if err := mt.logFd.Truncate(0); err != nil {
 		return err
 	}
