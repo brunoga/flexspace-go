@@ -42,9 +42,9 @@ func (ref *TableRef) Put(key, value []byte) error {
 
 	seq := db.seqNum.Add(1)
 	lockID := db.enterMT(h)
-	db.activeMT().put(pkey, storeValue, seq)
+	err := db.activeMT().put(pkey, storeValue, seq)
 	db.exitMT(lockID)
-	return nil
+	return err
 }
 
 // Get returns a copy of the value for key, or nil if not found.
@@ -150,9 +150,9 @@ func (ref *TableRef) Delete(key []byte) error {
 	return ref.Put(key, nil)
 }
 
-// Sync flushes all pending writes.
-func (ref *TableRef) Sync() {
-	ref.table.db.Sync()
+// Sync flushes all pending writes. Returns the first flush error, if any.
+func (ref *TableRef) Sync() error {
+	return ref.table.db.Sync()
 }
 
 // NewIterator creates a positioned iterator scoped to this table.
@@ -248,7 +248,9 @@ func (ref *TableRef) Update(key, oldValue, newValue []byte) (bool, error) {
 	}
 
 	seq := db.seqNum.Add(1)
-	db.activeMT().put(pkey, storeValue, seq)
+	if err := db.activeMT().put(pkey, storeValue, seq); err != nil {
+		return false, err
+	}
 	return true, nil
 }
 

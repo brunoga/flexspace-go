@@ -9,6 +9,7 @@ import (
 	"sync"
 )
 
+
 // Table is a named, isolated key-value namespace within a DB.
 // Each Table has its own on-disk flexfile, enabling O(1) DropTable.
 // Access data via Table.NewRef (one Ref per goroutine).
@@ -136,6 +137,9 @@ func (t *Table) Stats() TableStats {
 }
 
 func (t *Table) initSentinel() error {
+	// The file is empty at this point; SetTag has no extent to tag yet.
+	// The anchor tag at offset 0 is applied when the first KV is written
+	// via putPassthroughUnsorted. The call here is intentionally best-effort.
 	tag := fileTagGenerate(true, 0)
 	_ = t.ff.SetTag(0, tag)
 	return nil
@@ -272,7 +276,7 @@ func (t *Table) probePassthrough(key, itvbuf []byte, fp uint16) bool {
 	return len(e.kvs[i].Value) > 0
 }
 
-func (t *Table) putPassthrough(kv *KV, nh *nodeHandler) {
+func (t *Table) putPassthrough(kv *KV, nh *nodeHandler) error {
 	key := kv.Key
 	t.tree.nextAnchor(nh, key)
 
@@ -283,50 +287,67 @@ func (t *Table) putPassthrough(kv *KV, nh *nodeHandler) {
 	e := p.getEntryUnsorted(a, loff, t.itvbuf)
 
 	if e == nil {
-		t.putPassthroughUnsorted(kv, nh, a)
-		return
+		return t.putPassthroughUnsorted(kv, nh, a)
 	}
 
 	if a.unsorted > 0 {
-		t.rewriteInterval(nh, a, e)
+		if err := t.rewriteInterval(nh, a, e); err != nil {
+			p.releaseEntry(e)
+			return err
+		}
 		e.clearFrag()
 	}
 
-	t.putPassthroughCached(kv, nh, a, p, e)
+	if err := t.putPassthroughCached(kv, nh, a, p, e); err != nil {
+		p.releaseEntry(e)
+		return err
+	}
 
 	if e.frag {
-		t.rewriteInterval(nh, a, e)
+		if err := t.rewriteInterval(nh, a, e); err != nil {
+			p.releaseEntry(e)
+			return err
+		}
 		e.clearFrag()
 	}
 
 	if e.count >= sparseIntervalCount || a.psize >= sparseIntervalSize {
-		t.splitAnchor(nh, p, e)
+		if err := t.splitAnchor(nh, p, e); err != nil {
+			p.releaseEntry(e)
+			return err
+		}
 	}
 
 	p.releaseEntry(e)
+	return nil
 }
 
-func (t *Table) putPassthroughUnsorted(kv *KV, nh *nodeHandler, a *anchor) {
+func (t *Table) putPassthroughUnsorted(kv *KV, nh *nodeHandler, a *anchor) error {
 	anchorLoff := uint64(a.loff) + uint64(nh.shift)
 	n := encodeKV128(t.kvbuf, kv)
 	psize := uint32(n)
 	loff := anchorLoff + uint64(a.psize)
 
-	_, _ = t.ff.Insert(t.kvbuf[:n], loff)
+	if _, err := t.ff.Insert(t.kvbuf[:n], loff); err != nil {
+		return fmt.Errorf("flexdb: Insert failed: %w", err)
+	}
 	shiftUpPropagate(nh, int64(psize))
 
 	a.psize += psize
 	a.unsorted++
 
 	tag := fileTagGenerate(true, a.unsorted)
-	_ = t.ff.SetTag(anchorLoff, tag)
+	if err := t.ff.SetTag(anchorLoff, tag); err != nil {
+		return fmt.Errorf("flexdb: SetTag failed: %w", err)
+	}
 
 	if nh.node.parent != nil {
 		rebaseLeaf(nh.node)
 	}
+	return nil
 }
 
-func (t *Table) putPassthroughCached(kv *KV, nh *nodeHandler, a *anchor, p *cachePartition, e *cacheEntry) {
+func (t *Table) putPassthroughCached(kv *KV, nh *nodeHandler, a *anchor, p *cachePartition, e *cacheEntry) error {
 	anchorLoff := uint64(a.loff) + uint64(nh.shift)
 
 	newKV := dupKV(kv)
@@ -351,7 +372,9 @@ func (t *Table) putPassthroughCached(kv *KV, nh *nodeHandler, a *anchor, p *cach
 	if isUpdate {
 		oldPsize := uint32(kv128EncodedSize(len(e.kvs[idx].Key), len(e.kvs[idx].Value)))
 		e.replaceKV(p, newKV, idx)
-		_, _ = t.ff.Update(t.kvbuf[:n], loff, uint64(oldPsize))
+		if _, err := t.ff.Update(t.kvbuf[:n], loff, uint64(oldPsize)); err != nil {
+			return fmt.Errorf("flexdb: Update failed: %w", err)
+		}
 		if psize != oldPsize {
 			shiftUpPropagate(nh, int64(psize)-int64(oldPsize))
 		}
@@ -359,12 +382,22 @@ func (t *Table) putPassthroughCached(kv *KV, nh *nodeHandler, a *anchor, p *cach
 	} else {
 		e.insertKV(p, newKV, idx)
 		if idx == 0 {
+			// Clear the anchor bit from the current first extent before shifting
+			// it forward. This may legitimately fail when the interval is empty
+			// (maxLoff == 0) because there is no extent to tag yet; the
+			// subsequent Insert creates one and the tag is set below.
 			_ = t.ff.SetTag(loff, 0)
-			_, _ = t.ff.Insert(t.kvbuf[:n], loff)
+			if _, err := t.ff.Insert(t.kvbuf[:n], loff); err != nil {
+				return fmt.Errorf("flexdb: Insert failed: %w", err)
+			}
 			tag := fileTagGenerate(true, a.unsorted)
-			_ = t.ff.SetTag(loff, tag)
+			if err := t.ff.SetTag(loff, tag); err != nil {
+				return fmt.Errorf("flexdb: SetTag failed: %w", err)
+			}
 		} else {
-			_, _ = t.ff.Insert(t.kvbuf[:n], loff)
+			if _, err := t.ff.Insert(t.kvbuf[:n], loff); err != nil {
+				return fmt.Errorf("flexdb: Insert failed: %w", err)
+			}
 		}
 		shiftUpPropagate(nh, int64(psize))
 		a.psize += psize
@@ -373,9 +406,10 @@ func (t *Table) putPassthroughCached(kv *KV, nh *nodeHandler, a *anchor, p *cach
 	if nh.node.parent != nil {
 		rebaseLeaf(nh.node)
 	}
+	return nil
 }
 
-func (t *Table) rewriteInterval(nh *nodeHandler, a *anchor, e *cacheEntry) {
+func (t *Table) rewriteInterval(nh *nodeHandler, a *anchor, e *cacheEntry) error {
 	anchorLoff := uint64(a.loff) + uint64(nh.shift)
 	off := 0
 	for i := 0; i < e.count; i++ {
@@ -383,17 +417,22 @@ func (t *Table) rewriteInterval(nh *nodeHandler, a *anchor, e *cacheEntry) {
 		off += n
 	}
 	newPsize := uint32(off)
-	_, _ = t.ff.Update(t.itvbuf[:off], anchorLoff, uint64(a.psize))
+	if _, err := t.ff.Update(t.itvbuf[:off], anchorLoff, uint64(a.psize)); err != nil {
+		return fmt.Errorf("flexdb: Update failed: %w", err)
+	}
 	if newPsize != a.psize {
 		shiftUpPropagate(nh, int64(newPsize)-int64(a.psize))
 	}
 	a.psize = newPsize
 	a.unsorted = 0
 	tag := fileTagGenerate(true, 0)
-	_ = t.ff.SetTag(anchorLoff, tag)
+	if err := t.ff.SetTag(anchorLoff, tag); err != nil {
+		return fmt.Errorf("flexdb: SetTag failed: %w", err)
+	}
+	return nil
 }
 
-func (t *Table) splitAnchor(nh *nodeHandler, p *cachePartition, e *cacheEntry) {
+func (t *Table) splitAnchor(nh *nodeHandler, p *cachePartition, e *cacheEntry) error {
 	a := nh.node.anchors[nh.idx]
 	anchorLoff := uint64(a.loff) + uint64(nh.shift)
 
@@ -449,12 +488,16 @@ func (t *Table) splitAnchor(nh *nodeHandler, p *cachePartition, e *cacheEntry) {
 	}
 
 	tag := fileTagGenerate(true, 0)
-	_ = t.ff.SetTag(rightLoff, tag)
+	if err := t.ff.SetTag(rightLoff, tag); err != nil {
+		newP.releaseEntry(newE)
+		return fmt.Errorf("flexdb: SetTag failed: %w", err)
+	}
 
 	newP.releaseEntry(newE)
+	return nil
 }
 
-func (t *Table) deletePassthrough(key []byte, nh *nodeHandler, fp uint16) {
+func (t *Table) deletePassthrough(key []byte, nh *nodeHandler, fp uint16) error {
 	t.tree.nextAnchor(nh, key)
 	a := nh.node.anchors[nh.idx]
 	anchorLoff := uint64(a.loff) + uint64(nh.shift)
@@ -464,14 +507,16 @@ func (t *Table) deletePassthrough(key []byte, nh *nodeHandler, fp uint16) {
 	defer p.releaseEntry(e)
 
 	if a.unsorted > 0 {
-		t.rewriteInterval(nh, a, e)
+		if err := t.rewriteInterval(nh, a, e); err != nil {
+			return err
+		}
 		e.clearFrag()
 	}
 
 	loff := anchorLoff
 	i := e.findKeyEQ(key, fp)
 	if i >= sparseInterval || i >= e.count {
-		return
+		return nil
 	}
 
 	for j := range i {
@@ -482,11 +527,17 @@ func (t *Table) deletePassthrough(key []byte, nh *nodeHandler, fp uint16) {
 	e.deleteKV(p, i)
 
 	if i == 0 && e.count > 1 {
-		_ = t.ff.Collapse(loff, uint64(entryPsize))
+		if err := t.ff.Collapse(loff, uint64(entryPsize)); err != nil {
+			return fmt.Errorf("flexdb: Collapse failed: %w", err)
+		}
 		tag := fileTagGenerate(true, a.unsorted)
-		_ = t.ff.SetTag(loff, tag)
+		if err := t.ff.SetTag(loff, tag); err != nil {
+			return fmt.Errorf("flexdb: SetTag failed: %w", err)
+		}
 	} else {
-		_ = t.ff.Collapse(loff, uint64(entryPsize))
+		if err := t.ff.Collapse(loff, uint64(entryPsize)); err != nil {
+			return fmt.Errorf("flexdb: Collapse failed: %w", err)
+		}
 	}
 	shiftUpPropagate(nh, -int64(entryPsize))
 	a.psize -= entryPsize
@@ -496,9 +547,12 @@ func (t *Table) deletePassthrough(key []byte, nh *nodeHandler, fp uint16) {
 	}
 
 	if e.frag && a.psize > 0 {
-		t.rewriteInterval(nh, a, e)
+		if err := t.rewriteInterval(nh, a, e); err != nil {
+			return err
+		}
 		e.clearFrag()
 	}
+	return nil
 }
 
 func (t *Table) deleteUpdateTree(nh *nodeHandler, e *cacheEntry) {

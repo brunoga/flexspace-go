@@ -263,7 +263,12 @@ func (it *remoteScanIter) advance() {
 		return
 	}
 	it.key = []byte(row.Key)
-	it.val, _ = base64.StdEncoding.DecodeString(row.Value)
+	val, err := base64.StdEncoding.DecodeString(row.Value)
+	if err != nil {
+		it.valid = false
+		return
+	}
+	it.val = val
 	it.valid = true
 }
 
@@ -355,7 +360,12 @@ func (it *remoteIndexIter) advance() {
 	}
 	it.idxVal = []byte(row.IndexedValue)
 	it.pk = []byte(row.PrimaryKey)
-	it.record, _ = base64.StdEncoding.DecodeString(row.Record)
+	record, err := base64.StdEncoding.DecodeString(row.Record)
+	if err != nil {
+		it.valid = false
+		return
+	}
+	it.record = record
 	it.valid = true
 }
 
@@ -428,7 +438,10 @@ func (rc *RemoteClient) DumpData(w io.Writer) {
 			if curTable == nil {
 				continue
 			}
-			val, _ := base64.StdEncoding.DecodeString(line.Value)
+			val, err := base64.StdEncoding.DecodeString(line.Value)
+			if err != nil {
+				continue
+			}
 			curTable.Entries = append(curTable.Entries, DumpEntry{
 				Key:   line.Key,
 				Value: string(val),

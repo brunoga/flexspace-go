@@ -37,6 +37,11 @@ type DB struct {
 	flushWorker *flushWorker
 	flushMu     sync.Mutex // serialises concurrent swapAndFlush calls
 
+	// Stores the first error encountered in the background flush path.
+	// Returned by Sync() and Close(). Protected by flushErrMu.
+	flushErrMu sync.Mutex
+	flushErr   error
+
 	// 16-shard read-write locks for shared memtable access.
 	rwMT [lockShards]sync.RWMutex
 
@@ -154,7 +159,8 @@ func (db *DB) Table(name string) (*Table, error) {
 // After this call, any existing TableRef for the table must not be used.
 func (db *DB) DropTable(name string) error {
 	// Flush to ensure no pending writes for this table are left in the memtable.
-	db.Sync()
+	// Ignore sync errors here; DropTable is best-effort.
+	_ = db.Sync()
 
 	db.tablesMu.Lock()
 	defer db.tablesMu.Unlock()
@@ -187,13 +193,29 @@ func (db *DB) Tables() ([]string, error) {
 	return names, nil
 }
 
+// setFlushErr stores the first flush-path error encountered.
+func (db *DB) setFlushErr(err error) {
+	if err == nil {
+		return
+	}
+	db.flushErrMu.Lock()
+	if db.flushErr == nil {
+		db.flushErr = err
+	}
+	db.flushErrMu.Unlock()
+}
+
 // Close flushes all pending data and releases resources.
 func (db *DB) Close() error {
-	db.Sync()
+	syncErr := db.Sync()
 	if db.flushWorker != nil {
 		db.flushWorker.stop()
 	}
-	return db.closeAll()
+	closeErr := db.closeAll()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
 }
 
 func (db *DB) closeAll() error {
@@ -211,7 +233,8 @@ func (db *DB) closeAll() error {
 }
 
 // Sync forces a full flush of all pending writes to the flexfiles.
-func (db *DB) Sync() {
+// Returns the first error encountered in the flush path, if any.
+func (db *DB) Sync() error {
 	if db.flushWorker != nil {
 		db.flushWorker.triggerImmediate()
 	}
@@ -223,6 +246,10 @@ func (db *DB) Sync() {
 		t.blobs.sync()
 	}
 	db.tablesMu.RUnlock()
+	db.flushErrMu.Lock()
+	err := db.flushErr
+	db.flushErrMu.Unlock()
+	return err
 }
 
 // DBStats holds database-level statistics.
@@ -265,6 +292,7 @@ func (db *DB) immutableMT() *memtable {
 
 // swapAndFlush atomically swaps active/immutable memtables, then flushes
 // the old active (now immutable) to the appropriate flexfiles.
+// Errors are stored via setFlushErr and can be retrieved from Sync()/Close().
 func (db *DB) swapAndFlush() {
 	db.flushMu.Lock()
 	defer db.flushMu.Unlock()
@@ -279,17 +307,29 @@ func (db *DB) swapAndFlush() {
 	}
 
 	immut := db.memtables[old]
-	immut.flushLog()
-	db.flushMT(immut)
 
-	db.tablesMu.RLock()
-	for _, t := range db.tablesByID {
-		t.ff.Sync()
-		t.blobs.sync()
+	if err := immut.flushLog(); err != nil {
+		db.setFlushErr(fmt.Errorf("flexdb: flush WAL: %w", err))
+		// WAL buffer not fully on disk; proceed anyway — data is in skip-list
+		// and will be written to flexfiles below.
 	}
-	db.tablesMu.RUnlock()
 
-	immut.truncateLog()
+	if err := db.flushMT(immut); err != nil {
+		db.setFlushErr(err)
+		// Don't truncate WAL: data may not have reached flexfiles.
+		// Clear memtable anyway so the active MT can rotate in next cycle.
+	} else {
+		db.tablesMu.RLock()
+		for _, t := range db.tablesByID {
+			t.ff.Sync()
+			t.blobs.sync()
+		}
+		db.tablesMu.RUnlock()
+
+		if err := immut.truncateLog(); err != nil {
+			db.setFlushErr(fmt.Errorf("flexdb: truncate WAL: %w", err))
+		}
+	}
 
 	for i := range db.rwMT {
 		db.rwMT[i].Lock()
@@ -312,7 +352,7 @@ func (db *DB) flushActiveMT() {
 
 // flushMT writes all entries in mt to the appropriate table flexfiles.
 // Keys in mt are tableID-prefixed; the prefix is stripped before writing.
-func (db *DB) flushMT(mt *memtable) {
+func (db *DB) flushMT(mt *memtable) error {
 	var nh nodeHandler
 	var currentTableID uint32
 	var currentTable *Table
@@ -321,6 +361,7 @@ func (db *DB) flushMT(mt *memtable) {
 	var batch [memtableFlushBatch]entry
 	batchSize := 0
 
+	var flushErr error
 	flush := func() {
 		for i := 0; i < batchSize; i++ {
 			e := batch[i]
@@ -349,12 +390,16 @@ func (db *DB) flushMT(mt *memtable) {
 			h := hash32(userKey)
 			lockID := h & (lockShards - 1)
 			t.rwFF[lockID].Lock()
+			var err error
 			if len(e.value) == 0 {
-				t.deletePassthrough(userKey, &nh, fp16(h))
+				err = t.deletePassthrough(userKey, &nh, fp16(h))
 			} else {
-				t.putPassthrough(&KV{Key: userKey, Value: e.value}, &nh)
+				err = t.putPassthrough(&KV{Key: userKey, Value: e.value}, &nh)
 			}
 			t.rwFF[lockID].Unlock()
+			if err != nil && flushErr == nil {
+				flushErr = err
+			}
 		}
 		batchSize = 0
 	}
@@ -369,6 +414,7 @@ func (db *DB) flushMT(mt *memtable) {
 	if batchSize > 0 {
 		flush()
 	}
+	return flushErr
 }
 
 // ---- memtable locking helpers ----

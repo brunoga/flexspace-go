@@ -141,7 +141,9 @@ func (b *Batch) Commit() (bool, error) {
 	mt := db.activeMT()
 
 	// Write one atomic WAL record for the entire batch.
-	mt.logAppendBatch(pops, seq)
+	if err := mt.logAppendBatch(pops, seq); err != nil {
+		return false, err
+	}
 
 	// Apply all ops to the skip list.
 	for _, op := range pops {

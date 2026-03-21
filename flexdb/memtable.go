@@ -2,6 +2,7 @@ package flexdb
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -51,11 +52,14 @@ func (mt *memtable) close() error {
 }
 
 // put upserts a KV into the memtable and appends it to the WAL.
-func (mt *memtable) put(key, value []byte, seq uint64) {
-	mt.logAppend(key, value, seq)
+func (mt *memtable) put(key, value []byte, seq uint64) error {
+	if err := mt.logAppend(key, value, seq); err != nil {
+		return err
+	}
 	sz := int64(kv128EncodedSize(len(key), len(value)))
 	mt.m.Set(key, value)
 	mt.size.Add(sz)
+	return nil
 }
 
 // get returns the value for key, or (nil, false) if not present.
@@ -83,18 +87,22 @@ type walBatchOp struct {
 
 // logAppend encodes kv into the WAL buffer; flushes buffer when full.
 // Format: [sz:8][seq:8][KV(sz bytes)]
-func (mt *memtable) logAppend(key, value []byte, seq uint64) {
+func (mt *memtable) logAppend(key, value []byte, seq uint64) error {
 	sz := kv128EncodedSize(len(key), len(value))
 	needed := 8 + 8 + sz // sz + seq + kv
 	mt.mu.Lock()
 	if mt.logOff+needed > len(mt.logBuf) {
-		mt.flushLogLocked()
+		if err := mt.flushLogLocked(); err != nil {
+			mt.mu.Unlock()
+			return err
+		}
 	}
 	binary.LittleEndian.PutUint64(mt.logBuf[mt.logOff:], uint64(sz))
 	binary.LittleEndian.PutUint64(mt.logBuf[mt.logOff+8:], seq)
 	n := encodeKV128Data(mt.logBuf[mt.logOff+16:], key, value)
 	mt.logOff += 8 + 8 + n
 	mt.mu.Unlock()
+	return nil
 }
 
 // logAppendBatch writes all ops as a single atomic WAL record.
@@ -110,7 +118,7 @@ func (mt *memtable) logAppend(key, value []byte, seq uint64) {
 //	  [VI128 KV...]       tableID-prefixed key + value
 //
 // Callers must hold all rwMT write locks to guarantee atomicity.
-func (mt *memtable) logAppendBatch(ops []walBatchOp, seq uint64) {
+func (mt *memtable) logAppendBatch(ops []walBatchOp, seq uint64) error {
 	// Compute payload size: seq(8) + op_count(4) + for each op: kv_size(8) + kv_bytes
 	payloadSize := 8 + 4
 	for _, op := range ops {
@@ -139,34 +147,45 @@ func (mt *memtable) logAppendBatch(ops []walBatchOp, seq uint64) {
 
 	mt.mu.Lock()
 	if mt.logOff+needed > len(mt.logBuf) {
-		mt.flushLogLocked()
+		if err := mt.flushLogLocked(); err != nil {
+			mt.mu.Unlock()
+			return err
+		}
 	}
 	if needed > len(mt.logBuf) {
 		// Too large for the buffer; write directly to file.
 		buf := make([]byte, needed)
 		writeBatch(buf)
-		_, _ = mt.logFd.Write(buf)
+		_, err := mt.logFd.Write(buf)
 		mt.mu.Unlock()
-		return
+		if err != nil {
+			return fmt.Errorf("flexdb: WAL write failed: %w", err)
+		}
+		return nil
 	}
 	writeBatch(mt.logBuf[mt.logOff : mt.logOff+needed])
 	mt.logOff += needed
 	mt.mu.Unlock()
+	return nil
 }
 
 // flushLog writes the in-memory log buffer to disk.
-func (mt *memtable) flushLog() {
+func (mt *memtable) flushLog() error {
 	mt.mu.Lock()
-	mt.flushLogLocked()
+	err := mt.flushLogLocked()
 	mt.mu.Unlock()
+	return err
 }
 
-func (mt *memtable) flushLogLocked() {
+func (mt *memtable) flushLogLocked() error {
 	if mt.logOff == 0 {
-		return
+		return nil
 	}
-	_, _ = mt.logFd.Write(mt.logBuf[:mt.logOff])
+	if _, err := mt.logFd.Write(mt.logBuf[:mt.logOff]); err != nil {
+		return fmt.Errorf("flexdb: WAL write failed: %w", err)
+	}
 	mt.logOff = 0
+	return nil
 }
 
 // truncateLog resets the log file and writes a fresh header:
@@ -184,7 +203,9 @@ func (mt *memtable) truncateLog() error {
 	var hdr [16]byte
 	binary.LittleEndian.PutUint64(hdr[:8], uint64(time.Now().Unix()))
 	binary.LittleEndian.PutUint64(hdr[8:], mt.db.seqNum.Load())
-	_, _ = mt.logFd.Write(hdr[:])
+	if _, err := mt.logFd.Write(hdr[:]); err != nil {
+		return err
+	}
 	return nil
 }
 
