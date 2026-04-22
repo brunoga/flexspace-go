@@ -126,13 +126,13 @@ func (m *Metrics) routeSnapshot(route string) map[string]any {
 		minNs := rm.minNs.Load()
 		maxNs := rm.maxNs.Load()
 		snap["latency_ms"] = map[string]any{
-			"mean": roundMS(float64(rm.sumNs.Load()) / float64(reqs)),
-			"min":  roundMS(float64(minNs)),
-			"max":  roundMS(float64(maxNs)),
-			"p50":  roundMS(percentileMS(raw, reqs, 0.50)),
-			"p90":  roundMS(percentileMS(raw, reqs, 0.90)),
-			"p95":  roundMS(percentileMS(raw, reqs, 0.95)),
-			"p99":  roundMS(percentileMS(raw, reqs, 0.99)),
+			"mean":      roundMS(float64(rm.sumNs.Load()) / float64(reqs)),
+			"min":       roundMS(float64(minNs)),
+			"max":       roundMS(float64(maxNs)),
+			"p50":       roundMS(percentileMS(raw, reqs, 0.50)),
+			"p90":       roundMS(percentileMS(raw, reqs, 0.90)),
+			"p95":       roundMS(percentileMS(raw, reqs, 0.95)),
+			"p99":       roundMS(percentileMS(raw, reqs, 0.99)),
 			"histogram": hist,
 		}
 	}

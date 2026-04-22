@@ -88,7 +88,9 @@ func (rc *RemoteClient) doJSON(method, path string, in, out any) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		var e struct{ Error string `json:"error"` }
+		var e struct {
+			Error string `json:"error"`
+		}
 		json.NewDecoder(resp.Body).Decode(&e) //nolint:errcheck
 		if e.Error != "" {
 			die("%s %s: %s", method, path, e.Error)
@@ -120,7 +122,9 @@ func (rc *RemoteClient) doStream(path string) *http.Response {
 // ---- table management -------------------------------------------------------
 
 func (rc *RemoteClient) TableList() []string {
-	var r struct{ Tables []string `json:"tables"` }
+	var r struct {
+		Tables []string `json:"tables"`
+	}
 	rc.doJSON("GET", "/tables", nil, &r)
 	if r.Tables == nil {
 		return []string{}
@@ -202,13 +206,17 @@ func (rc *RemoteClient) Exists(table, key string) bool {
 }
 
 func (rc *RemoteClient) Count(table string) int {
-	var r struct{ Count int `json:"count"` }
+	var r struct {
+		Count int `json:"count"`
+	}
 	rc.doJSON("GET", "/tables/"+url.PathEscape(table)+"/count", nil, &r)
 	return r.Count
 }
 
 func (rc *RemoteClient) IndexCount(table, index string) int {
-	var r struct{ Count int `json:"count"` }
+	var r struct {
+		Count int `json:"count"`
+	}
 	rc.doJSON("GET", "/tables/"+url.PathEscape(table)+"/indexes/"+url.PathEscape(index)+"/count", nil, &r)
 	return r.Count
 }
@@ -295,7 +303,9 @@ func (it *remoteScanIter) Close()        { it.resp.Body.Close() }
 // ---- index ops --------------------------------------------------------------
 
 func (rc *RemoteClient) IndexList(table string) []SchemaIndex {
-	var r struct{ Indexes []SchemaIndex `json:"indexes"` }
+	var r struct {
+		Indexes []SchemaIndex `json:"indexes"`
+	}
 	rc.doJSON("GET", "/tables/"+url.PathEscape(table)+"/indexes", nil, &r)
 	if r.Indexes == nil {
 		return []SchemaIndex{}
@@ -387,13 +397,13 @@ func (it *remoteIndexIter) advance() {
 	it.valid = true
 }
 
-func (it *remoteIndexIter) Valid() bool                    { return it.valid }
-func (it *remoteIndexIter) Next()                          { it.advance() }
-func (it *remoteIndexIter) Value() []byte                  { return it.idxVal }
-func (it *remoteIndexIter) PrimaryKey() []byte             { return it.pk }
-func (it *remoteIndexIter) GetRecord() ([]byte, error)     { return it.record, nil }
-func (it *remoteIndexIter) Err() error                     { return it.err }
-func (it *remoteIndexIter) Close()                         { it.resp.Body.Close() }
+func (it *remoteIndexIter) Valid() bool                { return it.valid }
+func (it *remoteIndexIter) Next()                      { it.advance() }
+func (it *remoteIndexIter) Value() []byte              { return it.idxVal }
+func (it *remoteIndexIter) PrimaryKey() []byte         { return it.pk }
+func (it *remoteIndexIter) GetRecord() ([]byte, error) { return it.record, nil }
+func (it *remoteIndexIter) Err() error                 { return it.err }
+func (it *remoteIndexIter) Close()                     { it.resp.Body.Close() }
 
 // ---- batch ------------------------------------------------------------------
 
@@ -534,11 +544,11 @@ type remoteDBStats struct {
 }
 
 type remoteTableStats struct {
-	FileBytes   uint64              `json:"file_bytes"`
-	AnchorCount int                 `json:"anchor_count"`
-	CacheUsed   uint64              `json:"cache_used"`
-	CacheCap    uint64              `json:"cache_cap"`
-	Indexes     []remoteIndexStats  `json:"indexes"`
+	FileBytes   uint64             `json:"file_bytes"`
+	AnchorCount int                `json:"anchor_count"`
+	CacheUsed   uint64             `json:"cache_used"`
+	CacheCap    uint64             `json:"cache_cap"`
+	Indexes     []remoteIndexStats `json:"indexes"`
 }
 
 type remoteIndexStats struct {

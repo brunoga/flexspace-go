@@ -432,11 +432,11 @@ func (s *Server) handleTableStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"file_bytes":    st.FileBytes,
-		"anchor_count":  st.AnchorCount,
-		"cache_used":    st.CacheUsed,
-		"cache_cap":     st.CacheCap,
-		"indexes":       idxStats,
+		"file_bytes":   st.FileBytes,
+		"anchor_count": st.AnchorCount,
+		"cache_used":   st.CacheUsed,
+		"cache_cap":    st.CacheCap,
+		"indexes":      idxStats,
 	})
 }
 
@@ -596,7 +596,7 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		}
 		n++
 		if canFlush && n%100 == 0 {
-			bw.Flush()  //nolint:errcheck
+			bw.Flush() //nolint:errcheck
 			flusher.Flush()
 		}
 	}
@@ -756,7 +756,7 @@ func (s *Server) handleIndexScan(w http.ResponseWriter, r *http.Request) {
 		}
 		n++
 		if canFlush && n%100 == 0 {
-			bw.Flush()  //nolint:errcheck
+			bw.Flush() //nolint:errcheck
 			flusher.Flush()
 		}
 	}
@@ -1022,7 +1022,7 @@ func (s *Server) handleDumpData(w http.ResponseWriter, r *http.Request) {
 		}
 		it.Close()
 		if canFlush {
-			bw.Flush()  //nolint:errcheck
+			bw.Flush() //nolint:errcheck
 			flusher.Flush()
 		}
 	}

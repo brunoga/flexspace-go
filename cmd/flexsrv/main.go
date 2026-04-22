@@ -109,13 +109,13 @@ func cmdKeygen() {
 func cmdServe() {
 	fs := flag.NewFlagSet("flexsrv serve", flag.ExitOnError)
 	configFile := fs.String("config", "", "JSON config file")
-	dbPath     := fs.String("db", "", "database path")
-	listen     := fs.String("listen", "", "listen address (default 0.0.0.0:7700)")
-	certFile   := fs.String("cert", "", "TLS certificate PEM file")
-	keyFile    := fs.String("key", "", "TLS private key PEM file")
-	noTLS      := fs.Bool("no-tls", false, "disable TLS (not for production)")
-	logFormat  := fs.String("log-format", "text", "log format: text or json")
-	logLevel   := fs.String("log-level", "info", "log level: debug, info, warn, error")
+	dbPath := fs.String("db", "", "database path")
+	listen := fs.String("listen", "", "listen address (default 0.0.0.0:7700)")
+	certFile := fs.String("cert", "", "TLS certificate PEM file")
+	keyFile := fs.String("key", "", "TLS private key PEM file")
+	noTLS := fs.Bool("no-tls", false, "disable TLS (not for production)")
+	logFormat := fs.String("log-format", "text", "log format: text or json")
+	logLevel := fs.String("log-level", "info", "log level: debug, info, warn, error")
 	fs.Parse(os.Args[1:]) //nolint:errcheck
 
 	initLogger(*logFormat, *logLevel)
@@ -126,11 +126,21 @@ func cmdServe() {
 		os.Exit(1)
 	}
 	// CLI flags override config file.
-	if *dbPath   != "" { cfg.DBPath         = *dbPath   }
-	if *listen   != "" { cfg.Listen         = *listen   }
-	if *certFile != "" { cfg.TLS.CertFile   = *certFile }
-	if *keyFile  != "" { cfg.TLS.KeyFile    = *keyFile  }
-	if *noTLS         { cfg.TLS.Disabled    = true      }
+	if *dbPath != "" {
+		cfg.DBPath = *dbPath
+	}
+	if *listen != "" {
+		cfg.Listen = *listen
+	}
+	if *certFile != "" {
+		cfg.TLS.CertFile = *certFile
+	}
+	if *keyFile != "" {
+		cfg.TLS.KeyFile = *keyFile
+	}
+	if *noTLS {
+		cfg.TLS.Disabled = true
+	}
 
 	if cfg.DBPath == "" {
 		slog.Error("database path required: --db <path> or config.db_path")

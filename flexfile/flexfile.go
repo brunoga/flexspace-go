@@ -23,15 +23,10 @@ var (
 )
 
 const (
-	// maxOffset is the address space flexfile manages (800 GB).
-	maxOffset = 800 << 30
-
 	// blockBits defines the block size exponent (block size = 4 MiB).
 	blockBits = 22
 	// blockSize is the physical block size in bytes (4 MiB).
 	blockSize = 1 << blockBits
-	// blockCount is the total number of physical blocks in the address space.
-	blockCount = maxOffset >> blockBits
 
 	// maxExtentBit is used to calculate maxExtentSize.
 	maxExtentBit = 5
@@ -52,8 +47,6 @@ const (
 	chunkBits = 26
 	// chunkSize is the mmap chunk size in bytes (64 MiB).
 	chunkSize = 1 << chunkBits
-	// chunkCount is the number of mmap chunks covering the address space.
-	chunkCount = maxOffset >> chunkBits
 )
 
 // op represents a flexfile WAL operation code.
@@ -83,7 +76,9 @@ type FlexFile struct {
 	logBufSize   uint32
 	logTotalSize uint64
 
-	chunks map[uint64][]byte
+	chunks       [][]byte
+	lastChunkIdx uint64
+	lastChunk    []byte
 
 	bm *blockManager
 }
@@ -123,13 +118,14 @@ func Open(path string) (*FlexFile, error) {
 
 	logBuf := make([]byte, logMemCap)
 	ff := &FlexFile{
-		path:       path,
-		tree:       tree,
-		dataFile:   dataFile,
-		logFile:    logFile,
-		logBuf:     logBuf,
-		logBufBase: unsafe.Pointer(&logBuf[0]),
-		chunks:     make(map[uint64][]byte),
+		path:         path,
+		tree:         tree,
+		dataFile:     dataFile,
+		logFile:      logFile,
+		logBuf:       logBuf,
+		logBufBase:   unsafe.Pointer(&logBuf[0]),
+		chunks:       make([][]byte, 16),
+		lastChunkIdx: ^uint64(0),
 	}
 
 	// Redo log
@@ -149,10 +145,12 @@ func Open(path string) (*FlexFile, error) {
 
 func (ff *FlexFile) ensureMapping(offset uint64) error {
 	chunkIdx := offset >> chunkBits
-	if chunkIdx >= chunkCount {
-		return fmt.Errorf("offset out of bounds: %d", offset)
+	if chunkIdx == ff.lastChunkIdx {
+		return nil
 	}
-	if _, ok := ff.chunks[chunkIdx]; ok {
+	if chunkIdx < uint64(len(ff.chunks)) && ff.chunks[chunkIdx] != nil {
+		ff.lastChunkIdx = chunkIdx
+		ff.lastChunk = ff.chunks[chunkIdx]
 		return nil
 	}
 
@@ -183,7 +181,22 @@ func (ff *FlexFile) ensureMapping(offset uint64) error {
 	syscall.Syscall(syscall.SYS_MADVISE, p, uintptr(len(ptr)), syscall.MADV_SEQUENTIAL)
 	syscall.Syscall(syscall.SYS_MADVISE, p, uintptr(len(ptr)), syscall.MADV_WILLNEED)
 
+	if chunkIdx >= uint64(len(ff.chunks)) {
+		newCap := uint64(len(ff.chunks))
+		if newCap == 0 {
+			newCap = 16
+		}
+		for newCap <= chunkIdx {
+			newCap *= 2
+		}
+		newChunks := make([][]byte, newCap)
+		copy(newChunks, ff.chunks)
+		ff.chunks = newChunks
+	}
+
 	ff.chunks[chunkIdx] = ptr
+	ff.lastChunkIdx = chunkIdx
+	ff.lastChunk = ptr
 	return nil
 }
 
@@ -257,8 +270,10 @@ func (ff *FlexFile) Close() error {
 	}
 	_ = ff.bm.close() // already flushed by Sync(); ignore duplicate-flush error
 	for i, chunk := range ff.chunks {
-		syscall.Munmap(chunk)
-		delete(ff.chunks, i)
+		if chunk != nil {
+			syscall.Munmap(chunk)
+			ff.chunks[i] = nil
+		}
 	}
 	dataErr := ff.dataFile.Close()
 	logErr := ff.logFile.Close()
@@ -351,16 +366,22 @@ func (ff *FlexFile) Read(buf []byte, loff uint64) (int, error) {
 			chunkIdx := res.Poff >> chunkBits
 			chunkOff := res.Poff & (chunkSize - 1)
 
-			if chunkIdx < chunkCount {
-				chunk, ok := ff.chunks[chunkIdx]
-				if !ok {
-					ff.ensureMapping(res.Poff)
-					chunk = ff.chunks[chunkIdx]
+			var chunk []byte
+			if chunkIdx == ff.lastChunkIdx {
+				chunk = ff.lastChunk
+			} else if chunkIdx < uint64(len(ff.chunks)) {
+				chunk = ff.chunks[chunkIdx]
+			}
+
+			if chunk == nil {
+				if err := ff.ensureMapping(res.Poff); err == nil {
+					chunk = ff.lastChunk
 				}
-				if chunk != nil {
-					copy(targetBuf, chunk[chunkOff:chunkOff+res.Len])
-					n = int(res.Len)
-				}
+			}
+
+			if chunk != nil {
+				copy(targetBuf, chunk[chunkOff:chunkOff+res.Len])
+				n = int(res.Len)
 			}
 
 			if n == 0 {
@@ -692,8 +713,8 @@ type blockManager struct {
 func newBlockManager(ff *FlexFile) *blockManager {
 	return &blockManager{
 		ff:         ff,
-		usage:      make([]uint32, blockCount),
-		freeBlocks: blockCount,
+		usage:      make([]uint32, 16),
+		freeBlocks: 16,
 		currentBuf: &buffer{data: make([]byte, blockSize)},
 	}
 }
@@ -728,7 +749,7 @@ func (bm *blockManager) init(tree *flextree.Tree) error {
 }
 
 func (bm *blockManager) findEmptyBlock() (uint64, error) {
-	for i := bm.freeBlocksHint; i < blockCount; i++ {
+	for i := bm.freeBlocksHint; i < uint64(len(bm.usage)); i++ {
 		if bm.usage[i] == 0 {
 			bm.freeBlocksHint = i
 			return i, nil
@@ -740,13 +761,20 @@ func (bm *blockManager) findEmptyBlock() (uint64, error) {
 			return i, nil
 		}
 	}
-	return 0, fmt.Errorf("flexfile: no free blocks (storage capacity exceeded)")
+	// Grow capacity if no free blocks found.
+	blkID := uint64(len(bm.usage))
+	bm.ensureUsageCapacity(blkID)
+	bm.freeBlocksHint = blkID
+	return blkID, nil
 }
 
 // updateUsage adjusts the byte-usage counter for blkID by delta.
 func (bm *blockManager) updateUsage(blkID uint64, delta int32) {
 	if delta == 0 {
 		return
+	}
+	if blkID >= uint64(len(bm.usage)) {
+		bm.ensureUsageCapacity(blkID)
 	}
 	old := bm.usage[blkID]
 	newUsage := uint32(int32(old) + delta)
@@ -756,6 +784,23 @@ func (bm *blockManager) updateUsage(blkID uint64, delta int32) {
 	} else if newUsage == 0 {
 		bm.freeBlocks++
 	}
+}
+
+func (bm *blockManager) ensureUsageCapacity(maxBlkID uint64) {
+	if maxBlkID < uint64(len(bm.usage)) {
+		return
+	}
+	newCap := uint64(len(bm.usage))
+	if newCap == 0 {
+		newCap = 16
+	}
+	for newCap <= maxBlkID {
+		newCap *= 2
+	}
+	newUsage := make([]uint32, newCap)
+	copy(newUsage, bm.usage)
+	bm.freeBlocks += newCap - uint64(len(bm.usage))
+	bm.usage = newUsage
 }
 
 // offset returns the current physical write offset.

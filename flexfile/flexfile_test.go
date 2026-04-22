@@ -176,4 +176,3 @@ func BenchmarkFlexFileRead(b *testing.B) {
 	b.StopTimer()
 	ff.Close()
 }
-
