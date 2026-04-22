@@ -14,7 +14,7 @@ The system is built as a clean stack of four independent packages (and 2 executa
 | Package | Role |
 |---------|------|
 | `flextree` | Translates logical byte offsets to physical file positions via a memory-mapped B+tree. Supports insert/collapse shifting so the logical address space stays contiguous as data grows or shrinks. |
-| `flexfile` | Builds a durable, 800 GB logical flat file on top of flextree, with chunked mmap I/O, a write-ahead log, and a background GC pass for block defragmentation. |
+| `flexfile` | Builds a durable, virtually unbounded logical flat file on top of flextree, with chunked mmap I/O, a write-ahead log, and a background GC pass for block defragmentation. |
 | `flexdb` | Adds multi-table management, a double-buffered in-memory memtable (with WAL), a background flush worker, per-table caching, atomic multi-table write batches, and monotonically increasing sequence numbers. |
 | `flexkv` | The user-facing layer: named tables, `Indexer`-function-based secondary indexes maintained atomically with writes, prefix/range scan, and multi-valued index support. |
 | `cmd/flexctl` | A SQLite-style CLI and REPL for administering flexkv databases without writing any code. |

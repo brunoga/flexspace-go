@@ -146,7 +146,7 @@ func TestBruteForceDelete(t *testing.T) {
 
 	// Build: [0, 100), [100, 200), [200, 300)
 	for i := 0; i < 3; i++ {
-		poff := uint64((i+1) * 1000)
+		poff := uint64((i + 1) * 1000)
 		if err := bf.InsertWithTag(uint64(i*100), poff, 100, 0); err != nil {
 			t.Fatal(err)
 		}
@@ -448,21 +448,21 @@ func TestBruteForceInsertSplit(t *testing.T) {
 
 	// Verify structure
 	if extents[0].Loff != 0 || extents[0].Len != 300 {
-		t.Fatalf("left: expected [0, 300) len 300, got [%d, %d) len %d", 
+		t.Fatalf("left: expected [0, 300) len 300, got [%d, %d) len %d",
 			extents[0].Loff, extents[0].Loff+uint64(extents[0].Len), extents[0].Len)
 	}
-	
+
 	if extents[1].Loff != 300 || extents[1].Len != 100 || extents[1].Tag != 42 {
-		t.Fatalf("middle: expected [300, 400) len 100 tag 42, got [%d, %d) len %d tag %d", 
+		t.Fatalf("middle: expected [300, 400) len 100 tag 42, got [%d, %d) len %d tag %d",
 			extents[1].Loff, extents[1].Loff+uint64(extents[1].Len), extents[1].Len, extents[1].Tag)
 	}
-	
+
 	// Right extent starts at 400 (after insert), length is 700 (1000 - 300 = 700)
 	if extents[2].Loff != 400 || extents[2].Len != 700 {
-		t.Fatalf("right: expected [400, 1100) len 700, got [%d, %d) len %d", 
+		t.Fatalf("right: expected [400, 1100) len 700, got [%d, %d) len %d",
 			extents[2].Loff, extents[2].Loff+uint64(extents[2].Len), extents[2].Len)
 	}
-	
+
 	// Right extent poff should be 5000 + 300 = 5300
 	if extents[2].Poff != 5300 {
 		t.Fatalf("right poff: expected 5300, got %d", extents[2].Poff)

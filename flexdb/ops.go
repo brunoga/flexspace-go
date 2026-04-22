@@ -255,6 +255,6 @@ func (ref *TableRef) Update(key, oldValue, newValue []byte) (bool, error) {
 }
 
 var (
-	errInvalidKV   = errors.New("flexdb: invalid KV (empty key or key exceeds MaxKVSize)")
+	errInvalidKV    = errors.New("flexdb: invalid KV (empty key or key exceeds MaxKVSize)")
 	errBlobTooLarge = errors.New("flexdb: value exceeds MaxBlobSize")
 )

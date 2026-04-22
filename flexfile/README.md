@@ -8,10 +8,10 @@ Package `flexfile` provides a durable, flat logical address space backed by a me
 
 ## Logical vs. Physical Layout
 
-The logical address space is a flat stream of bytes, addressed from 0 to up to **800 GiB**. The physical data file is chunked into **4 MiB blocks**. The `flextree` extent tree maps any logical offset to the physical block and offset within it.
+The logical address space is a flat stream of bytes that grows dynamically as data is written. The physical data file is chunked into **4 MiB blocks**. The `flextree` extent tree maps any logical offset to the physical block and offset within it.
 
 ```
-Logical space:   [0 ─────────── 800 GiB)
+Logical space:   [0 ────────────────── ∞)
                   │ extent tree │
 Physical blocks: [blk0][blk1][blk2]…
 ```
@@ -104,7 +104,7 @@ For a flexfile at path `dir/FLEXFILE/`:
 
 ```
 FLEXFILE/
-├── DATA            Physical data file (sparse; up to 800 GiB apparent size)
+├── DATA            Physical data file (sparse; grows dynamically)
 ├── LOG             Write-ahead log
 ├── FLEXTREE_META   Extent tree header (checkpoint)
 └── FLEXTREE_NODE   Extent tree node array (checkpoint)

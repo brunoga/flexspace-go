@@ -9,14 +9,13 @@ import (
 	"sync"
 )
 
-
 // Table is a named, isolated key-value namespace within a DB.
 // Each Table has its own on-disk flexfile, enabling O(1) DropTable.
 // Access data via Table.NewRef (one Ref per goroutine).
 type Table struct {
-	db    *DB
-	id    uint32
-	name  string
+	db   *DB
+	id   uint32
+	name string
 
 	ff    Storage
 	tree  *dbTree
