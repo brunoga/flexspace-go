@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"sync"
 	"unsafe"
@@ -75,11 +76,13 @@ type Tree struct {
 	lastBase      uint64
 }
 
-// slabSize is the number of nodes allocated per slab.
-const slabSize = 4096
+const (
+	slabSize = 4096
+	nodeSize = 1024
 
-// nodeSize is the fixed size of a node on disk.
-const nodeSize = 1024
+	treeMetaMagic   = 0x46545245 // 'FTRE'
+	treeMetaVersion = 1
+)
 
 // NewTree creates an empty tree with the given maximum extent size.
 // maxExtentSize defines the largest contiguous extent that can be stored.
@@ -721,7 +724,7 @@ func (t *Tree) iterateNodeRec(n *node, loff uint64, fn func(loff, poff uint64, l
 // Dirty nodes are written to new positions before the metadata is updated,
 // so a crash mid-sync leaves the previous committed state intact.
 func (t *Tree) Sync(metaPath, nodePath string) error {
-	nodeFile, err := os.OpenFile(nodePath, os.O_RDWR|os.O_CREATE, 0644)
+	nodeFile, err := os.OpenFile(nodePath, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
 		return err
 	}
@@ -740,22 +743,39 @@ func (t *Tree) Sync(metaPath, nodePath string) error {
 	}
 
 	// Write metadata only after all new node data is on disk.
-	metaFile, err := os.OpenFile(metaPath, os.O_RDWR|os.O_CREATE, 0644)
+	metaFile, err := os.OpenFile(metaPath, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
 		return err
 	}
+
 	defer metaFile.Close()
 
-	metaBuf := make([]byte, 128)
-	binary.LittleEndian.PutUint64(metaBuf[0:8], t.maxLoff)
-	binary.LittleEndian.PutUint32(metaBuf[8:12], t.maxExtentSize)
-	binary.LittleEndian.PutUint64(metaBuf[12:20], t.version)
-	binary.LittleEndian.PutUint64(metaBuf[20:28], t.nodeCount)
-	binary.LittleEndian.PutUint64(metaBuf[28:36], t.maxNodeID)
-	binary.LittleEndian.PutUint64(metaBuf[36:44], t.rootID)
-	if _, err := metaFile.WriteAt(metaBuf, 0); err != nil {
+	t.version++
+
+	metaBuf := make([]byte, 4096) // Use a full page for atomicity
+	binary.LittleEndian.PutUint32(metaBuf[0:4], treeMetaMagic)
+	binary.LittleEndian.PutUint32(metaBuf[4:8], treeMetaVersion)
+	binary.LittleEndian.PutUint64(metaBuf[8:16], t.maxLoff)
+	binary.LittleEndian.PutUint32(metaBuf[16:20], t.maxExtentSize)
+	binary.LittleEndian.PutUint64(metaBuf[20:28], t.version)
+	binary.LittleEndian.PutUint64(metaBuf[28:36], t.nodeCount)
+	binary.LittleEndian.PutUint64(metaBuf[36:44], t.maxNodeID)
+	binary.LittleEndian.PutUint64(metaBuf[44:52], t.rootID)
+
+	// Compute checksum for the first 52 bytes.
+	c := crc32.ChecksumIEEE(metaBuf[:52])
+	binary.LittleEndian.PutUint32(metaBuf[52:56], c)
+
+	// Write to one of the two meta pages (ping-pong for atomicity).
+	off := int64(0)
+	if t.version%2 != 0 {
+		off = 4096
+	}
+
+	if _, err := metaFile.WriteAt(metaBuf, off); err != nil {
 		return err
 	}
+
 	if err := metaFile.Sync(); err != nil {
 		return err
 	}
@@ -852,24 +872,85 @@ func LoadTree(metaPath, nodePath string) (*Tree, error) {
 	}
 	defer nodeFile.Close()
 
-	metaBuf := make([]byte, 128)
-	if _, err := metaFile.ReadAt(metaBuf, 0); err != nil {
-		return nil, err
+	// Read both meta pages and pick the one with the highest valid version.
+	metaBuf := make([]byte, 8192)
+	n, _ := metaFile.ReadAt(metaBuf, 0)
+
+	var bestMeta []byte
+	var maxVer uint64
+	foundValid := false
+
+	for i := 0; i < 2; i++ {
+		off := i * 4096
+		if off+56 > n {
+			continue
+		}
+		p := metaBuf[off : off+4096]
+		magic := binary.LittleEndian.Uint32(p[0:4])
+		if magic != treeMetaMagic {
+			continue
+		}
+
+		// Verify checksum.
+		storedC := binary.LittleEndian.Uint32(p[52:56])
+		if crc32.ChecksumIEEE(p[:52]) != storedC {
+			continue
+		}
+
+		ver := binary.LittleEndian.Uint64(p[20:28])
+		if ver >= maxVer {
+			maxVer = ver
+			bestMeta = p
+			foundValid = true
+		}
 	}
 
-	mes := binary.LittleEndian.Uint32(metaBuf[8:12])
+	if !foundValid {
+		// Try legacy format only if no versioned meta found.
+		if n >= 48 {
+			bestMeta = metaBuf[0:4096]
+		} else {
+			return nil, fmt.Errorf("flextree: no valid metadata found")
+		}
+	}
+
+	var maxLoff, version, nodeCount, maxNodeID, rootID uint64
+	var mes uint32
+
+	magic := binary.LittleEndian.Uint32(bestMeta[0:4])
+	if magic == treeMetaMagic {
+		v := binary.LittleEndian.Uint32(bestMeta[4:8])
+		if v > treeMetaVersion {
+			return nil, fmt.Errorf("flextree: unsupported metadata version %d", v)
+		}
+		maxLoff = binary.LittleEndian.Uint64(bestMeta[8:16])
+		mes = binary.LittleEndian.Uint32(bestMeta[16:20])
+		version = binary.LittleEndian.Uint64(bestMeta[20:28])
+		nodeCount = binary.LittleEndian.Uint64(bestMeta[28:36])
+		maxNodeID = binary.LittleEndian.Uint64(bestMeta[36:44])
+		rootID = binary.LittleEndian.Uint64(bestMeta[44:52])
+	} else {
+		// Legacy format.
+		maxLoff = binary.LittleEndian.Uint64(bestMeta[0:8])
+		mes = binary.LittleEndian.Uint32(bestMeta[8:12])
+		version = binary.LittleEndian.Uint64(bestMeta[12:20])
+		nodeCount = binary.LittleEndian.Uint64(bestMeta[20:28])
+		maxNodeID = binary.LittleEndian.Uint64(bestMeta[28:36])
+		rootID = binary.LittleEndian.Uint64(bestMeta[36:44])
+	}
+
 	mask := uint64(0)
 	if mes&(mes-1) == 0 {
 		mask = uint64(mes) - 1
 	}
 	t := &Tree{
-		maxLoff:       binary.LittleEndian.Uint64(metaBuf[0:8]),
+		maxLoff:       maxLoff,
 		maxExtentSize: mes,
 		extentMask:    mask,
-		version:       binary.LittleEndian.Uint64(metaBuf[12:20]),
-		nodeCount:     binary.LittleEndian.Uint64(metaBuf[20:28]),
-		maxNodeID:     binary.LittleEndian.Uint64(metaBuf[28:36]),
-		rootID:        binary.LittleEndian.Uint64(metaBuf[36:44]),
+		version:       version,
+		nodeCount:     nodeCount,
+		maxNodeID:     maxNodeID,
+		rootID:        rootID,
 		freeIDs:       make([]uint64, 0),
 		leafSlabs:     make([][]node, 0),
 		internalSlabs: make([][]node, 0),
@@ -877,7 +958,7 @@ func LoadTree(metaPath, nodePath string) (*Tree, error) {
 		nextInternal:  slabSize,
 	}
 
-	t.root, err = t.loadNodeRec(t.rootID, nodeFile)
+	t.root, err = t.loadNodeRec(t.rootID, nodeFile, make(map[uint64]bool))
 	if err != nil {
 		return nil, err
 	}
@@ -908,7 +989,12 @@ func collectNodeIDs(n *node, ids map[uint64]struct{}) {
 	}
 }
 
-func (t *Tree) loadNodeRec(id uint64, f *os.File) (*node, error) {
+func (t *Tree) loadNodeRec(id uint64, f *os.File, seen map[uint64]bool) (*node, error) {
+	if seen[id] {
+		return nil, fmt.Errorf("flextree: circular dependency detected at node %d", id)
+	}
+	seen[id] = true
+
 	buf := make([]byte, nodeSize)
 	if _, err := f.ReadAt(buf, int64(id*nodeSize)); err != nil {
 		return nil, err
@@ -938,10 +1024,11 @@ func (t *Tree) loadNodeRec(id uint64, f *os.File) (*node, error) {
 			in.children[i].shift = int64(binary.LittleEndian.Uint64(buf[off : off+8]))
 			in.childrenIDs[i] = binary.LittleEndian.Uint64(buf[off+8 : off+16])
 
-			child, err := t.loadNodeRec(in.childrenIDs[i], f)
+			child, err := t.loadNodeRec(in.childrenIDs[i], f, seen)
 			if err != nil {
 				return nil, err
 			}
+
 			in.children[i].node = child
 		}
 	}

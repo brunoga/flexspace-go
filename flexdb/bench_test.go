@@ -1,6 +1,7 @@
 package flexdb
 
 import (
+	"context"
 	"math/rand"
 	"os"
 	"testing"
@@ -38,12 +39,13 @@ func openFresh(b *testing.B, capMB uint64) (*DB, *TableRef, string) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	db, err := Open(dir, capMB)
+	db, err := Open(context.Background(), dir, &Options{CacheMB: capMB})
 	if err != nil {
 		os.RemoveAll(dir)
 		b.Fatal(err)
 	}
-	tbl, err := db.Table("bench")
+	tbl, err := db.Table(context.Background(), "bench")
+
 	if err != nil {
 		db.Close()
 		os.RemoveAll(dir)
@@ -63,13 +65,13 @@ func benchPutSeq(b *testing.B, vlen int) {
 	keys := makeKeys(b.N + 1000)
 
 	for i := range 1000 {
-		ref.Put(keys[i], val) //nolint:errcheck
+		ref.Put(context.Background(), keys[i], val) //nolint:errcheck
 	}
 
 	b.ResetTimer()
 	b.SetBytes(int64(23 + vlen))
 	for i := 0; i < b.N; i++ {
-		ref.Put(keys[i], val) //nolint:errcheck
+		ref.Put(context.Background(), keys[i], val) //nolint:errcheck
 	}
 	b.StopTimer()
 }
@@ -93,7 +95,7 @@ func benchPutRand(b *testing.B, vlen int) {
 	b.ResetTimer()
 	b.SetBytes(int64(23 + vlen))
 	for i := 0; i < b.N; i++ {
-		ref.Put(keys[i], val) //nolint:errcheck
+		ref.Put(context.Background(), keys[i], val) //nolint:errcheck
 	}
 	b.StopTimer()
 }
@@ -111,14 +113,14 @@ func benchGetMemtable(b *testing.B, vlen int) {
 	val := makeVal(vlen)
 	nkeys := 100000
 	for i := range nkeys {
-		ref.Put(makeKey(i), val) //nolint:errcheck
+		ref.Put(context.Background(), makeKey(i), val) //nolint:errcheck
 	}
 
 	keys := makeKeys(nkeys)
 	b.ResetTimer()
 	b.SetBytes(int64(23 + vlen))
 	for i := 0; i < b.N; i++ {
-		ref.Get(keys[i%nkeys]) //nolint:errcheck
+		ref.Get(context.Background(), keys[i%nkeys]) //nolint:errcheck
 	}
 	b.StopTimer()
 }
@@ -136,14 +138,14 @@ func benchGetMemtableView(b *testing.B, vlen int) {
 	val := makeVal(vlen)
 	nkeys := 100000
 	for i := range nkeys {
-		ref.Put(makeKey(i), val) //nolint:errcheck
+		ref.Put(context.Background(), makeKey(i), val) //nolint:errcheck
 	}
 
 	keys := makeKeys(nkeys)
 	b.ResetTimer()
 	b.SetBytes(int64(23 + vlen))
 	for i := 0; i < b.N; i++ {
-		ref.GetView(keys[i%nkeys]) //nolint:errcheck
+		ref.GetView(context.Background(), keys[i%nkeys]) //nolint:errcheck
 	}
 	b.StopTimer()
 }
@@ -161,19 +163,19 @@ func benchGetFile(b *testing.B, vlen int) {
 	val := makeVal(vlen)
 	nkeys := 50000
 	for i := range nkeys {
-		ref.Put(makeKey(i), val) //nolint:errcheck
+		ref.Put(context.Background(), makeKey(i), val) //nolint:errcheck
 	}
-	ref.Sync()
+	ref.Sync(context.Background())
 
 	keys := makeKeys(nkeys)
 	for i := range nkeys {
-		ref.Get(keys[i]) //nolint:errcheck
+		ref.Get(context.Background(), keys[i]) //nolint:errcheck
 	}
 
 	b.ResetTimer()
 	b.SetBytes(int64(23 + vlen))
 	for i := 0; i < b.N; i++ {
-		ref.Get(keys[i%nkeys]) //nolint:errcheck
+		ref.Get(context.Background(), keys[i%nkeys]) //nolint:errcheck
 	}
 	b.StopTimer()
 }
@@ -191,19 +193,19 @@ func benchGetFileView(b *testing.B, vlen int) {
 	val := makeVal(vlen)
 	nkeys := 50000
 	for i := range nkeys {
-		ref.Put(makeKey(i), val) //nolint:errcheck
+		ref.Put(context.Background(), makeKey(i), val) //nolint:errcheck
 	}
-	ref.Sync()
+	ref.Sync(context.Background())
 
 	keys := makeKeys(nkeys)
 	for i := range nkeys {
-		ref.GetView(keys[i]) //nolint:errcheck
+		ref.GetView(context.Background(), keys[i]) //nolint:errcheck
 	}
 
 	b.ResetTimer()
 	b.SetBytes(int64(23 + vlen))
 	for i := 0; i < b.N; i++ {
-		ref.GetView(keys[i%nkeys]) //nolint:errcheck
+		ref.GetView(context.Background(), keys[i%nkeys]) //nolint:errcheck
 	}
 	b.StopTimer()
 }
@@ -222,13 +224,13 @@ func benchDelete(b *testing.B, vlen int) {
 	n := b.N + 1000
 	keys := makeKeys(n)
 	for i := range n {
-		ref.Put(keys[i], val) //nolint:errcheck
+		ref.Put(context.Background(), keys[i], val) //nolint:errcheck
 	}
 
 	b.ResetTimer()
 	b.SetBytes(int64(23))
 	for i := 0; i < b.N; i++ {
-		ref.Delete(keys[i]) //nolint:errcheck
+		ref.Delete(context.Background(), keys[i]) //nolint:errcheck
 	}
 	b.StopTimer()
 }
@@ -246,9 +248,9 @@ func benchIterScan(b *testing.B, vlen int) {
 	val := makeVal(vlen)
 	nkeys := 100000
 	for i := range nkeys {
-		ref.Put(makeKey(i), val) //nolint:errcheck
+		ref.Put(context.Background(), makeKey(i), val) //nolint:errcheck
 	}
-	ref.Sync()
+	ref.Sync(context.Background())
 
 	b.ResetTimer()
 	b.SetBytes(int64(23 + vlen))

@@ -2,21 +2,25 @@ package flexdb
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"time"
 )
 
 // Put inserts or updates a key-value pair in the table. Values larger than
 // MaxKVSize−len(key) bytes are stored in the per-table blob file; a 16-byte
 // sentinel is written to the main KV store in their place.
 // Caller must not hold any DB locks.
-func (ref *TableRef) Put(key, value []byte) error {
+func (ref *TableRef) Put(ctx context.Context, key, value []byte) error {
 	t := ref.table
 	db := t.db
+	db.metrics.PutCount.Add(1)
 	if len(key) == 0 || len(key) > MaxKVSize {
-		return errInvalidKV
+		return ErrInvalidKV
 	}
+
 	if len(value) > MaxBlobSize {
-		return errBlobTooLarge
+		return ErrBlobTooLarge
 	}
 
 	storeValue := value
@@ -36,8 +40,17 @@ func (ref *TableRef) Put(key, value []byte) error {
 	pkey := makePrefixedKey(t.id, key)
 	h := hash32(pkey)
 
+	maxWait := time.Now().Add(30 * time.Second)
 	for db.activeMT().isFull() {
 		// Brief yield; background worker swaps when ready.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Millisecond):
+		}
+		if time.Now().After(maxWait) {
+			return errors.New("flexdb: timeout waiting for memtable space (is flush worker running?)")
+		}
 	}
 
 	seq := db.seqNum.Add(1)
@@ -49,8 +62,10 @@ func (ref *TableRef) Put(key, value []byte) error {
 
 // Get returns a copy of the value for key, or nil if not found.
 // For blob values the bytes are read from the blob file into a fresh slice.
-func (ref *TableRef) Get(key []byte) ([]byte, error) {
-	val, err := ref.GetView(key)
+func (ref *TableRef) Get(ctx context.Context, key []byte) ([]byte, error) {
+	ref.table.db.metrics.GetCount.Add(1)
+	val, err := ref.GetView(ctx, key)
+
 	if err != nil || val == nil {
 		return nil, err
 	}
@@ -66,7 +81,7 @@ func (ref *TableRef) Get(key []byte) ([]byte, error) {
 // GetView returns the value for key. For inline values the returned slice is
 // only valid until the next mutating operation on the DB. For blob values a
 // fresh allocation is always returned (identical behaviour to Get).
-func (ref *TableRef) GetView(key []byte) ([]byte, error) {
+func (ref *TableRef) GetView(ctx context.Context, key []byte) ([]byte, error) {
 	t := ref.table
 	db := t.db
 	pkey := makePrefixedKey(t.id, key)
@@ -112,7 +127,7 @@ func (ref *TableRef) GetView(key []byte) ([]byte, error) {
 }
 
 // Probe checks whether a key exists. Returns false for tombstones.
-func (ref *TableRef) Probe(key []byte) (bool, error) {
+func (ref *TableRef) Probe(ctx context.Context, key []byte) (bool, error) {
 	t := ref.table
 	db := t.db
 	pkey := makePrefixedKey(t.id, key)
@@ -146,13 +161,14 @@ func (ref *TableRef) Probe(key []byte) (bool, error) {
 }
 
 // Delete removes a key by inserting a tombstone.
-func (ref *TableRef) Delete(key []byte) error {
-	return ref.Put(key, nil)
+func (ref *TableRef) Delete(ctx context.Context, key []byte) error {
+	ref.table.db.metrics.DeleteCount.Add(1)
+	return ref.Put(ctx, key, nil)
 }
 
 // Sync flushes all pending writes. Returns the first flush error, if any.
-func (ref *TableRef) Sync() error {
-	return ref.table.db.Sync()
+func (ref *TableRef) Sync(ctx context.Context) error {
+	return ref.table.db.Sync(ctx)
 }
 
 // NewIterator creates a positioned iterator scoped to this table.
@@ -173,22 +189,31 @@ func (ref *TableRef) NewIterator() *Iterator {
 //
 // Pass nil oldValue to require the key to be absent.
 // Pass nil newValue to delete the key when the match succeeds.
-func (ref *TableRef) Update(key, oldValue, newValue []byte) (bool, error) {
+func (ref *TableRef) Update(ctx context.Context, key, oldValue, newValue []byte) (bool, error) {
 	t := ref.table
 	db := t.db
 	if len(key) == 0 || len(key) > MaxKVSize {
-		return false, errInvalidKV
+		return false, ErrInvalidKV
 	}
 	if len(newValue) > MaxBlobSize {
-		return false, errBlobTooLarge
+		return false, ErrBlobTooLarge
 	}
 
 	pkey := makePrefixedKey(t.id, key)
 	h := hash32(pkey)
 	lockID := h & (lockShards - 1)
 
-	// Spin until the active memtable has capacity (same as Put).
+	// Wait until the active memtable has capacity (same as Put).
+	maxWait := time.Now().Add(30 * time.Second)
 	for db.activeMT().isFull() {
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(time.Millisecond):
+		}
+		if time.Now().After(maxWait) {
+			return false, errors.New("flexdb: timeout waiting for memtable space (is flush worker running?)")
+		}
 	}
 
 	// Hold the write lock for this MT shard for the entire check+write.
@@ -253,8 +278,3 @@ func (ref *TableRef) Update(key, oldValue, newValue []byte) (bool, error) {
 	}
 	return true, nil
 }
-
-var (
-	errInvalidKV    = errors.New("flexdb: invalid KV (empty key or key exceeds MaxKVSize)")
-	errBlobTooLarge = errors.New("flexdb: value exceeds MaxBlobSize")
-)

@@ -67,31 +67,36 @@ Values whose combined key+value size fits within 4 KiB are stored inline in the 
 ### Using flexkv in Go
 
 ```go
-import "github.com/brunoga/flexspace-go/flexkv"
+import (
+    "context"
+    "github.com/brunoga/flexspace-go/flexkv"
+)
+
+ctx := context.Background()
 
 // Open (or create) a database.
-db, err := flexkv.Open("/var/data/mydb", &flexkv.Options{CacheMB: 64})
+db, err := flexkv.Open(ctx, "/var/data/mydb", &flexkv.Options{CacheMB: 64})
 if err != nil {
     log.Fatal(err)
 }
 defer db.Close()
 
 // Open a table.
-users, err := db.Table("users")
+users, err := db.Table(ctx, "users")
 if err != nil {
     log.Fatal(err)
 }
 
 // Write.
-if err := users.Put([]byte("alice"), []byte("engineer")); err != nil {
+if err := users.Put(ctx, []byte("alice"), []byte("engineer")); err != nil {
     log.Fatal(err)
 }
-if err := users.Put([]byte("bob"), []byte("designer")); err != nil {
+if err := users.Put(ctx, []byte("bob"), []byte("designer")); err != nil {
     log.Fatal(err)
 }
 
 // Read.
-val, _ := users.Get([]byte("alice"))
+val, _ := users.Get(ctx, []byte("alice"))
 fmt.Println(string(val)) // engineer
 
 // Scan all keys.
@@ -102,7 +107,7 @@ for ; it.Valid(); it.Next() {
 }
 
 // Add a secondary index on the whole value.
-err = users.CreateIndex("by_role", func(_, v []byte) [][]byte {
+err = users.CreateIndex(ctx, "by_role", func(_, v []byte) [][]byte {
     return [][]byte{v}
 })
 
@@ -111,7 +116,8 @@ idx := users.Index("by_role")
 iit := idx.Get([]byte("engineer"))
 defer iit.Close()
 for ; iit.Valid(); iit.Next() {
-    fmt.Printf("engineer: %s\n", iit.PrimaryKey())
+    rec, _ := iit.GetRecord(ctx)
+    fmt.Printf("engineer: %s (full record: %s)\n", iit.PrimaryKey(), rec)
 }
 ```
 
@@ -129,8 +135,8 @@ batch.Check(usersTable.RawDataTable(), []byte("alice"), []byte(expected))
 batch.Put(usersTable.RawDataTable(), []byte("alice"), []byte("staff-engineer"))
 batch.Put(logsTable.RawDataTable(),  []byte("2026-03-18"), []byte("alice promoted"))
 
-seq, err := batch.Commit()
-if err != nil {
+committed, err := batch.Commit(ctx)
+if err != nil || !committed {
     log.Println("batch rejected:", err)
 }
 ```

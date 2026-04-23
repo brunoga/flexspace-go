@@ -14,6 +14,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -397,13 +398,13 @@ func (it *remoteIndexIter) advance() {
 	it.valid = true
 }
 
-func (it *remoteIndexIter) Valid() bool                { return it.valid }
-func (it *remoteIndexIter) Next()                      { it.advance() }
-func (it *remoteIndexIter) Value() []byte              { return it.idxVal }
-func (it *remoteIndexIter) PrimaryKey() []byte         { return it.pk }
-func (it *remoteIndexIter) GetRecord() ([]byte, error) { return it.record, nil }
-func (it *remoteIndexIter) Err() error                 { return it.err }
-func (it *remoteIndexIter) Close()                     { it.resp.Body.Close() }
+func (it *remoteIndexIter) Valid() bool                               { return it.valid }
+func (it *remoteIndexIter) Next()                                     { it.advance() }
+func (it *remoteIndexIter) Value() []byte                             { return it.idxVal }
+func (it *remoteIndexIter) PrimaryKey() []byte                        { return it.pk }
+func (it *remoteIndexIter) GetRecord(context.Context) ([]byte, error) { return it.record, nil }
+func (it *remoteIndexIter) Err() error                                { return it.err }
+func (it *remoteIndexIter) Close()                                    { it.resp.Body.Close() }
 
 // ---- batch ------------------------------------------------------------------
 

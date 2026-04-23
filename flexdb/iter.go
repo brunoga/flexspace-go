@@ -21,7 +21,11 @@ import (
 type Iterator struct {
 	table *Table
 
+	// Pinned memtables to prevent clear during iteration.
+	pinned [2]*memtable
+
 	// File iterator state (uses table.tree/cache directly; keys have no prefix).
+
 	fileNode    *treeNode
 	fileAncIdx  int
 	fileKVIdx   int
@@ -57,6 +61,8 @@ func (it *Iterator) Seek(key []byte) {
 	it.currentKV.Key = nil
 	it.currentKV.Value = nil
 
+	it.unpinMemtables()
+
 	// Seek file iterator (table-scoped, no prefix).
 	it.seekFile(key)
 
@@ -70,8 +76,15 @@ func (it *Iterator) Seek(key []byte) {
 		copy(pkey[4:], key)
 	}
 
-	// Seek active memtable.
+	// Snapshot and pin current memtables.
 	active := db.activeMT()
+	immut := db.immutableMT()
+	it.pinned[0] = active
+	it.pinned[1] = immut
+	active.readers.Add(1)
+	immut.readers.Add(1)
+
+	// Seek active memtable.
 	if !active.hidden.Load() {
 		si := active.m.Seek(pkey)
 		it.mtIters[0] = si
@@ -82,7 +95,6 @@ func (it *Iterator) Seek(key []byte) {
 	}
 
 	// Seek immutable memtable.
-	immut := db.immutableMT()
 	if !immut.hidden.Load() {
 		si := immut.m.Seek(pkey)
 		it.mtIters[1] = si
@@ -301,9 +313,19 @@ func (it *Iterator) Next() {
 // Close releases iterator resources.
 func (it *Iterator) Close() {
 	it.releaseFileCE()
+	it.unpinMemtables()
 	it.valid = false
 	it.currentKV.Key = nil
 	it.currentKV.Value = nil
+}
+
+func (it *Iterator) unpinMemtables() {
+	for i := range it.pinned {
+		if it.pinned[i] != nil {
+			it.pinned[i].readers.Add(-1)
+			it.pinned[i] = nil
+		}
+	}
 }
 
 // tableIDPrefix builds the 4-byte big-endian prefix for tableID.

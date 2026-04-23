@@ -42,6 +42,7 @@ type cachePartition struct {
 
 	tick *cacheEntry // clock pointer
 	ff   Storage
+	db   *DB
 }
 
 // dbCache is the full cache over all partitions.
@@ -49,12 +50,13 @@ type dbCache struct {
 	partitions [cachePartitionCount]cachePartition
 }
 
-func newDBCache(ff Storage, capMB uint64) *dbCache {
+func newDBCache(db *DB, ff Storage, capMB uint64) *dbCache {
 	c := &dbCache{}
 	perPart := capMB * (1 << 20) / cachePartitionCount
 	for i := range c.partitions {
 		c.partitions[i].cap = perPart
 		c.partitions[i].ff = ff
+		c.partitions[i].db = db
 	}
 	return c
 }
@@ -75,6 +77,9 @@ func (p *cachePartition) getEntry(a *anchor, loff uint64, itvbuf []byte) *cacheE
 		e.refcnt++
 		e.access = cacheEntryChance
 		p.mu.Unlock()
+		if p.db != nil {
+			p.db.metrics.CacheHitCount.Add(1)
+		}
 		return e
 	}
 	// Allocate and mark as loading.
@@ -84,6 +89,10 @@ func (p *cachePartition) getEntry(a *anchor, loff uint64, itvbuf []byte) *cacheE
 	a.cacheEntry = e
 	p.linkEntry(e)
 	p.mu.Unlock()
+
+	if p.db != nil {
+		p.db.metrics.CacheMissCount.Add(1)
+	}
 
 	// Load from flexfile without holding the lock.
 	p.loadEntry(e, a, loff, itvbuf)
@@ -281,8 +290,14 @@ func (e *cacheEntry) findKeyGE(key []byte, fp uint16) int {
 
 // insertKV inserts kv at position i, shifting others right. Updates size.
 func (e *cacheEntry) insertKV(p *cachePartition, kv *KV, i int) {
+	if e.count >= sparseInterval {
+		// Entry full; mark as fragmented so it gets split on next load/eviction.
+		e.frag = true
+		return
+	}
 	sz := uint32(kv128EncodedSize(len(kv.Key), len(kv.Value)))
 	copy(e.kvs[i+1:e.count+1], e.kvs[i:e.count])
+
 	copy(e.fps[i+1:e.count+1], e.fps[i:e.count])
 	e.kvs[i] = kv
 	e.fps[i] = fp16(hash32(kv.Key))

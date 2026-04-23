@@ -35,6 +35,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -249,6 +250,7 @@ func makeIndexer(idx SchemaIndex) (flexkv.Indexer, error) {
 
 // ctx holds an open database (local or remote) and schema state.
 type ctx struct {
+	ctx    context.Context
 	db     *flexkv.DB               // nil when remote != nil
 	path   string                   // DB file path or server URL
 	schema map[string][]SchemaIndex // table → index defs (local only)
@@ -275,18 +277,20 @@ func openCtx(path string) *ctx {
 			os.Args = append(os.Args[:2], os.Args[3:]...)
 		}
 		return &ctx{
+			ctx:    context.Background(),
 			path:   path,
 			remote: newRemoteClient(path, key, insecure),
 			schema: make(map[string][]SchemaIndex),
 		}
 	}
 
-	db, err := flexkv.Open(path, &flexkv.Options{CacheMB: 64})
+	bg := context.Background()
+	db, err := flexkv.Open(bg, path, &flexkv.Options{CacheMB: 64})
 	check(err, "open db")
 
-	c := &ctx{db: db, path: path, schema: make(map[string][]SchemaIndex), tables: make(map[string]*flexkv.Table)}
+	c := &ctx{ctx: bg, db: db, path: path, schema: make(map[string][]SchemaIndex), tables: make(map[string]*flexkv.Table)}
 
-	st, err := db.Table(schemaTable)
+	st, err := db.Table(c.ctx, schemaTable)
 	check(err, "open schema table")
 
 	it := st.Scan(nil, nil)
@@ -301,7 +305,7 @@ func openCtx(path string) *ctx {
 		c.schema[tableName] = indexes
 
 		// Re-open the table and re-register indexers (no re-scan).
-		tbl, err := db.Table(tableName)
+		tbl, err := db.Table(c.ctx, tableName)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "flexctl: warning: could not open table %q: %v\n", tableName, err)
 			continue
@@ -313,7 +317,7 @@ func openCtx(path string) *ctx {
 				fmt.Fprintf(os.Stderr, "flexctl: warning: indexer %q on %q: %v\n", idx.Name, tableName, err)
 				continue
 			}
-			if err := tbl.RegisterIndex(idx.Name, fn); err != nil {
+			if err := tbl.RegisterIndex(c.ctx, idx.Name, fn); err != nil {
 				fmt.Fprintf(os.Stderr, "flexctl: warning: RegisterIndex %q on %q: %v\n", idx.Name, tableName, err)
 			}
 		}
@@ -333,7 +337,7 @@ func (c *ctx) table(name string) *flexkv.Table {
 	if tbl, ok := c.tables[name]; ok {
 		return tbl
 	}
-	tbl, err := c.db.Table(name)
+	tbl, err := c.db.Table(c.ctx, name)
 	check(err, "open table "+name)
 	c.tables[name] = tbl
 	return tbl
@@ -344,7 +348,7 @@ func (c *ctx) saveSchemaEntry(tableName string, indexes []SchemaIndex) {
 	st := c.table(schemaTable)
 	data, err := json.Marshal(indexes)
 	check(err, "marshal schema")
-	check(st.Put([]byte(tableName), data), "write schema")
+	check(st.Put(c.ctx, []byte(tableName), data), "write schema")
 	c.schema[tableName] = indexes
 }
 
@@ -425,11 +429,11 @@ func cmdTableDrop(c *ctx, args []string) {
 		c.remote.TableDrop(name)
 		return
 	}
-	check(c.db.DropTable(name), "drop table")
+	check(c.db.DropTable(c.ctx, name), "drop table")
 	delete(c.tables, name)
 	// Remove schema entry too.
 	st := c.table(schemaTable)
-	check(st.Delete([]byte(name)), "remove schema entry")
+	check(st.Delete(c.ctx, []byte(name)), "remove schema entry")
 	delete(c.schema, name)
 }
 
@@ -505,14 +509,15 @@ func cmdValueGet(c *ctx, args []string) {
 		if c.remote != nil {
 			it := c.remote.IndexScan(tableName, indexName, key, nextKey(key), 0)
 			defer it.Close()
-			printIndexScan(it, 0)
+			printIndexScan(c.ctx, it, 0)
 			return
 		}
 		it := c.table(tableName).Index(indexName).Get(key)
 		defer it.Close()
-		printIndexScan(it, 0)
+		printIndexScan(c.ctx, it, 0)
 		return
 	}
+
 	if c.remote != nil {
 		val := c.remote.Get(args[0], args[1])
 		if val == nil {
@@ -525,7 +530,7 @@ func cmdValueGet(c *ctx, args []string) {
 		return
 	}
 	tbl := c.table(args[0])
-	val, err := tbl.Get([]byte(args[1]))
+	val, err := tbl.Get(c.ctx, []byte(args[1]))
 	check(err, "get")
 	if val == nil {
 		if !replMode {
@@ -555,7 +560,7 @@ func cmdValuePut(c *ctx, args []string) {
 		return
 	}
 	tbl := c.table(args[0])
-	check(tbl.Put([]byte(args[1]), []byte(args[2])), "put")
+	check(tbl.Put(c.ctx, []byte(args[1]), []byte(args[2])), "put")
 }
 
 func cmdValueDelete(c *ctx, args []string) {
@@ -576,7 +581,7 @@ func cmdValueDelete(c *ctx, args []string) {
 		return
 	}
 	tbl := c.table(args[0])
-	check(tbl.Delete([]byte(args[1])), "delete")
+	check(tbl.Delete(c.ctx, []byte(args[1])), "delete")
 }
 
 // cmdValueExists exits 0 if the key is present, 1 if absent. In REPL mode it
@@ -598,7 +603,7 @@ func cmdValueExists(c *ctx, args []string) {
 		}
 		return
 	}
-	val, err := c.table(args[0]).Get([]byte(args[1]))
+	val, err := c.table(args[0]).Get(c.ctx, []byte(args[1]))
 	check(err, "exists")
 	if val == nil {
 		if replMode {
@@ -728,14 +733,14 @@ func cmdIndexCreate(c *ctx, args []string) {
 	for _, idx := range existing {
 		if idx.Name == idxName {
 			// Already exists: re-register without re-scanning data.
-			check(tbl.RegisterIndex(idxName, fn), "register index")
+			check(tbl.RegisterIndex(c.ctx, idxName, fn), "register index")
 			info("index %q on %q already exists (re-registered)", idxName, tableName)
 			return
 		}
 	}
 
 	// New index: create and populate from existing data.
-	check(tbl.CreateIndex(idxName, fn), "create index")
+	check(tbl.CreateIndex(c.ctx, idxName, fn), "create index")
 	c.saveSchemaEntry(tableName, append(existing, idxSpec))
 	info("index %q created on %q", idxName, tableName)
 }
@@ -753,7 +758,7 @@ func cmdIndexDrop(c *ctx, args []string) {
 	}
 
 	tbl := c.table(tableName)
-	check(tbl.DropIndex(idxName), "drop index")
+	check(tbl.DropIndex(c.ctx, idxName), "drop index")
 
 	existing := c.schema[tableName]
 	var updated []SchemaIndex
@@ -780,14 +785,14 @@ func cmdIndexScan(c *ctx, args []string, limit int) {
 	if c.remote != nil {
 		it := c.remote.IndexScan(args[0], args[1], start, end, limit)
 		defer it.Close()
-		printIndexScan(it, limit)
+		printIndexScan(c.ctx, it, limit)
 		return
 	}
 	tbl := c.table(args[0])
 	idx := tbl.Index(args[1])
 	it := idx.Scan(start, end)
 	defer it.Close()
-	printIndexScan(it, limit)
+	printIndexScan(c.ctx, it, limit)
 }
 
 func cmdIndexScanPrefix(c *ctx, args []string, limit int) {
@@ -797,12 +802,12 @@ func cmdIndexScanPrefix(c *ctx, args []string, limit int) {
 	if c.remote != nil {
 		it := c.remote.IndexScanPrefix(args[0], args[1], []byte(args[2]), limit)
 		defer it.Close()
-		printIndexScan(it, limit)
+		printIndexScan(c.ctx, it, limit)
 		return
 	}
 	it := c.table(args[0]).Index(args[1]).ScanPrefix([]byte(args[2]))
 	defer it.Close()
-	printIndexScan(it, limit)
+	printIndexScan(c.ctx, it, limit)
 }
 
 // ---- schema entity ---------------------------------------------------------
@@ -878,12 +883,13 @@ func cmdSchemaLoad(c *ctx, args []string) {
 			check(err, fmt.Sprintf("indexer %q on %q", idx.Name, st.Name))
 			if existingSet[idx.Name] {
 				// Index already exists; just re-register the function.
-				check(tbl.RegisterIndex(idx.Name, fn), "register index")
+				check(tbl.RegisterIndex(c.ctx, idx.Name, fn), "register index")
 			} else {
 				// New index: create and populate from existing data.
-				check(tbl.CreateIndex(idx.Name, fn), "create index")
+				check(tbl.CreateIndex(c.ctx, idx.Name, fn), "create index")
 			}
 		}
+
 		c.saveSchemaEntry(st.Name, st.Indexes)
 	}
 }
@@ -968,7 +974,7 @@ func cmdDatabaseLoad(c *ctx, args []string) {
 	for _, dt := range d.Tables {
 		tbl := c.table(dt.Name)
 		for _, e := range dt.Entries {
-			check(tbl.Put([]byte(e.Key), []byte(e.Value)), "import put")
+			check(tbl.Put(c.ctx, []byte(e.Key), []byte(e.Value)), "import put")
 		}
 	}
 }
@@ -1072,7 +1078,7 @@ func applyBatch(c *ctx, bf *BatchFile) {
 		}
 	}
 
-	committed, err := batch.Commit()
+	committed, err := batch.Commit(c.ctx)
 	check(err, "batch commit")
 	if !committed {
 		die("batch rejected: a pre-condition check failed")
@@ -1160,12 +1166,12 @@ func parseIndexSpec(name string, args []string) (SchemaIndex, error) {
 
 // ---- scan helpers ----------------------------------------------------------
 
-func printIndexScan(it interface {
+func printIndexScan(ctx context.Context, it interface {
 	Valid() bool
 	Next()
 	Value() []byte
 	PrimaryKey() []byte
-	GetRecord() ([]byte, error)
+	GetRecord(context.Context) ([]byte, error)
 	Close()
 }, limit int) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
@@ -1173,7 +1179,7 @@ func printIndexScan(it interface {
 	for ; it.Valid(); it.Next() {
 		idxVal := it.Value()
 		pk := it.PrimaryKey()
-		rec, err := it.GetRecord()
+		rec, err := it.GetRecord(ctx)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "flexctl: GetRecord: %v\n", err)
 			continue
@@ -1355,9 +1361,10 @@ func cmdDatabaseStats(c *ctx) {
 		for _, idx := range indexes {
 			// Ensure the index table is open by re-registering the indexer.
 			if fn, err := makeIndexer(idx); err == nil {
-				tbl.RegisterIndex(idx.Name, fn) //nolint — opens indexFDB as a side effect
+				tbl.RegisterIndex(c.ctx, idx.Name, fn) //nolint — opens indexFDB as a side effect
 			}
 			ft, ok := tbl.RawIndexTable(idx.Name)
+
 			if !ok {
 				fmt.Fprintf(w, "    .%s:\t(not open)\n", idx.Name)
 				continue
@@ -1607,7 +1614,7 @@ func (fc *flexCompleter) indexNames(tableName string) []string {
 // string representation starts with prefix, skipping keys that contain
 // non-printable bytes.
 func (fc *flexCompleter) tableKeys(tableName, prefix string) []string {
-	tbl, err := fc.c.db.Table(tableName)
+	tbl, err := fc.c.db.Table(fc.c.ctx, tableName)
 	if err != nil {
 		return nil
 	}
@@ -1626,7 +1633,7 @@ func (fc *flexCompleter) tableKeys(tableName, prefix string) []string {
 // indexValues returns up to maxKeyCompletions index values from the named index
 // on tableName that start with prefix, skipping values with non-printable bytes.
 func (fc *flexCompleter) indexValues(tableName, indexName, prefix string) (vals []string) {
-	tbl, err := fc.c.db.Table(tableName)
+	tbl, err := fc.c.db.Table(fc.c.ctx, tableName)
 	if err != nil {
 		return nil
 	}

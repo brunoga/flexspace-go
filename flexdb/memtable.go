@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -13,10 +13,8 @@ import (
 
 // Memtable constants matching the C implementation.
 const (
-	memtableCap           = 1024 << 20 // 1 GB
-	memtableFlushBatch    = 1024
-	memtableFlushInterval = 5 * time.Second
-	memtableLogBufCap     = 4 << 20 // 4 MB
+	memtableFlushBatch = 1024
+	memtableLogBufCap  = 4 << 20 // 4 MB
 )
 
 // memtable is one of the two double-buffered ordered in-memory tables.
@@ -30,11 +28,16 @@ type memtable struct {
 	mu     sync.Mutex // protects logBuf
 	size   atomic.Int64
 	hidden atomic.Bool // true = immutable (being flushed / just cleared)
+
+	// readers tracks concurrent readers of this memtable.
+	// Used to safely clear the memtable after flush.
+	readers atomic.Int32
 }
 
 func newMemtable(db *DB, logPath string) (*memtable, error) {
-	f, err := os.OpenFile(logPath, os.O_RDWR|os.O_CREATE, 0644)
+	f, err := os.OpenFile(logPath, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
+
 		return nil, err
 	}
 	mt := &memtable{
@@ -68,11 +71,15 @@ func (mt *memtable) put(key, value []byte, seq uint64) error {
 
 // get returns the value for key, or (nil, false) if not present.
 func (mt *memtable) get(key []byte) ([]byte, bool) {
+	mt.readers.Add(1)
+	defer mt.readers.Add(-1)
 	return mt.m.Get(key)
 }
 
 // probe returns: 0=not found, 1=tombstone, 2=valid value
 func (mt *memtable) probe(key []byte) int {
+	mt.readers.Add(1)
+	defer mt.readers.Add(-1)
 	v, ok := mt.m.Get(key)
 	if !ok {
 		return 0
@@ -300,14 +307,15 @@ func (mt *memtable) redoLog(path string) (maxSeq uint64, err error) {
 				maxSeq = seq
 			}
 			if off+sz > len(buf) {
-				log.Printf("flexdb: WAL entry truncated at offset %d\n", off)
+				slog.Error("flexdb: WAL entry truncated", "offset", off)
 				break
 			}
 			kv, n := decodeKV128(buf[off:])
 			if kv == nil || n != sz {
-				log.Printf("flexdb: WAL decode failed at offset %d\n", off)
+				slog.Error("flexdb: WAL decode failed", "offset", off)
 				break
 			}
+
 			mt.m.Set(kv.Key, kv.Value)
 			off += sz
 		}
@@ -317,12 +325,16 @@ func (mt *memtable) redoLog(path string) (maxSeq uint64, err error) {
 
 // isFull returns true when the memtable has grown past the capacity threshold.
 func (mt *memtable) isFull() bool {
-	return mt.size.Load() >= memtableCap
+	return mt.size.Load() >= mt.db.memtableCap
 }
 
-// clear resets the memtable map and size counter (called after flush completes).
-func (mt *memtable) clear() {
-	mt.m.Clear()
+// reset replaces the memtable map and size counter (called after flush completes).
+// Spins until all readers have finished using the old map.
+func (mt *memtable) reset() {
+	for mt.readers.Load() > 0 {
+		time.Sleep(1 * time.Microsecond)
+	}
+	mt.m = newSkipList()
 	mt.size.Store(0)
 }
 
@@ -333,6 +345,8 @@ type flushWorker struct {
 	quit chan struct{}
 	done chan struct{}
 
+	stopOnce sync.Once
+
 	immediateWork atomic.Bool
 }
 
@@ -341,7 +355,9 @@ func (w *flushWorker) start() {
 }
 
 func (w *flushWorker) stop() {
-	close(w.quit)
+	w.stopOnce.Do(func() {
+		close(w.quit)
+	})
 	<-w.done
 }
 
@@ -351,6 +367,12 @@ func (w *flushWorker) triggerImmediate() {
 
 func (w *flushWorker) run() {
 	defer close(w.done)
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("flexdb: flush worker panicked", "error", r)
+		}
+	}()
+
 	msTimer := time.NewTicker(time.Millisecond)
 	defer msTimer.Stop()
 
@@ -367,7 +389,7 @@ func (w *flushWorker) run() {
 			active := w.db.activeMT()
 			shouldFlush := w.immediateWork.Swap(false) ||
 				active.isFull() ||
-				time.Since(lastFlush) >= memtableFlushInterval
+				time.Since(lastFlush) >= w.db.flushInter
 
 			if shouldFlush && !active.hidden.Load() {
 				w.db.swapAndFlush()

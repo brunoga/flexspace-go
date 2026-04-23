@@ -150,7 +150,8 @@ func cmdServe() {
 		cfg.Listen = "0.0.0.0:7700"
 	}
 
-	db, err := flexkv.Open(cfg.DBPath, nil)
+	db, err := flexkv.Open(context.Background(), cfg.DBPath, nil)
+
 	if err != nil {
 		slog.Error("open db", "err", err)
 		os.Exit(1)

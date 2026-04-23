@@ -1,6 +1,7 @@
 package flexdb
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"os"
@@ -20,7 +21,9 @@ func tempDir(t *testing.T) string {
 
 func mustOpenDB(t *testing.T, dir string) *DB {
 	t.Helper()
-	db, err := Open(dir, 64)
+	opts := DefaultOptions()
+	opts.CacheMB = 64
+	db, err := Open(context.Background(), dir, opts)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -29,7 +32,7 @@ func mustOpenDB(t *testing.T, dir string) *DB {
 
 func mustTable(t *testing.T, db *DB, name string) *Table {
 	t.Helper()
-	tbl, err := db.Table(name)
+	tbl, err := db.Table(context.Background(), name)
 	if err != nil {
 		t.Fatalf("Table(%q): %v", name, err)
 	}
@@ -54,14 +57,14 @@ func TestPutGet(t *testing.T) {
 	for i := range 100 {
 		key := fmt.Appendf(nil, "key%05d", i)
 		val := fmt.Appendf(nil, "val%05d", i)
-		if err := ref.Put(key, val); err != nil {
+		if err := ref.Put(context.Background(), key, val); err != nil {
 			t.Fatalf("Put %d: %v", i, err)
 		}
 	}
 	for i := range 100 {
 		key := fmt.Appendf(nil, "key%05d", i)
 		want := string(fmt.Appendf(nil, "val%05d", i))
-		got, err := ref.Get(key)
+		got, err := ref.Get(context.Background(), key)
 		if err != nil {
 			t.Fatalf("Get %d: %v", i, err)
 		}
@@ -70,7 +73,7 @@ func TestPutGet(t *testing.T) {
 		}
 	}
 
-	got, err := ref.Get([]byte("nope"))
+	got, err := ref.Get(context.Background(), []byte("nope"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,14 +92,14 @@ func TestProbe(t *testing.T) {
 	key := []byte("hello")
 	val := []byte("world")
 
-	found, err := ref.Probe(key)
+	found, err := ref.Probe(context.Background(), key)
 	if err != nil || found {
 		t.Fatalf("Probe before put: found=%v err=%v", found, err)
 	}
-	if err := ref.Put(key, val); err != nil {
+	if err := ref.Put(context.Background(), key, val); err != nil {
 		t.Fatal(err)
 	}
-	found, err = ref.Probe(key)
+	found, err = ref.Probe(context.Background(), key)
 	if err != nil || !found {
 		t.Fatalf("Probe after put: found=%v err=%v", found, err)
 	}
@@ -112,14 +115,14 @@ func TestDelete(t *testing.T) {
 	key := []byte("delme")
 	val := []byte("value")
 
-	if err := ref.Put(key, val); err != nil {
+	if err := ref.Put(context.Background(), key, val); err != nil {
 		t.Fatal(err)
 	}
-	if err := ref.Delete(key); err != nil {
+	if err := ref.Delete(context.Background(), key); err != nil {
 		t.Fatal(err)
 	}
 
-	got, err := ref.Get(key)
+	got, err := ref.Get(context.Background(), key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +142,7 @@ func TestIterator(t *testing.T) {
 	for i := range n {
 		key := fmt.Appendf(nil, "k%05d", i)
 		val := fmt.Appendf(nil, "v%05d", i)
-		if err := ref.Put(key, val); err != nil {
+		if err := ref.Put(context.Background(), key, val); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -172,11 +175,11 @@ func TestSyncAndReopen(t *testing.T) {
 		for i := range 20 {
 			key := fmt.Appendf(nil, "key%05d", i)
 			val := fmt.Appendf(nil, "val%05d", i)
-			if err := ref.Put(key, val); err != nil {
+			if err := ref.Put(context.Background(), key, val); err != nil {
 				t.Fatal(err)
 			}
 		}
-		ref.Sync()
+		ref.Sync(context.Background())
 		if err := db.Close(); err != nil {
 			t.Fatal(err)
 		}
@@ -189,7 +192,7 @@ func TestSyncAndReopen(t *testing.T) {
 		for i := range 20 {
 			key := fmt.Appendf(nil, "key%05d", i)
 			want := string(fmt.Appendf(nil, "val%05d", i))
-			got, err := ref.Get(key)
+			got, err := ref.Get(context.Background(), key)
 			if err != nil {
 				t.Fatalf("reopen Get %d: %v", i, err)
 			}
@@ -211,14 +214,14 @@ func TestLargeDataset(t *testing.T) {
 	for i := range n {
 		key := fmt.Appendf(nil, "key%08d", i)
 		val := fmt.Appendf(nil, "val%08d", i)
-		if err := ref.Put(key, val); err != nil {
+		if err := ref.Put(context.Background(), key, val); err != nil {
 			t.Fatalf("Put %d: %v", i, err)
 		}
 	}
 	for i := range n {
 		key := fmt.Appendf(nil, "key%08d", i)
 		want := string(fmt.Appendf(nil, "val%08d", i))
-		got, err := ref.Get(key)
+		got, err := ref.Get(context.Background(), key)
 		if err != nil {
 			t.Fatalf("Get %d: %v", i, err)
 		}
@@ -236,14 +239,14 @@ func TestUpdate(t *testing.T) {
 	tbl := mustTable(t, db, "test")
 	ref := tbl.NewRef()
 	key := []byte("mykey")
-	if err := ref.Put(key, []byte("v1")); err != nil {
+	if err := ref.Put(context.Background(), key, []byte("v1")); err != nil {
 		t.Fatal(err)
 	}
-	if err := ref.Put(key, []byte("v2")); err != nil {
+	if err := ref.Put(context.Background(), key, []byte("v2")); err != nil {
 		t.Fatal(err)
 	}
 
-	got, err := ref.Get(key)
+	got, err := ref.Get(context.Background(), key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,13 +270,13 @@ func TestRandomRW(t *testing.T) {
 		k := fmt.Appendf(nil, "k%06d", rng.Intn(1000))
 		v := fmt.Appendf(nil, "v%d", rng.Int())
 		m[string(k)] = string(v)
-		if err := ref.Put(k, v); err != nil {
+		if err := ref.Put(context.Background(), k, v); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 	}
 
 	for k, want := range m {
-		got, err := ref.Get([]byte(k))
+		got, err := ref.Get(context.Background(), []byte(k))
 		if err != nil {
 			t.Fatalf("Get %q: %v", k, err)
 		}
@@ -293,11 +296,11 @@ func TestSyncReopenLarge(t *testing.T) {
 		for i := range n {
 			key := fmt.Appendf(nil, "key%08d", i)
 			val := fmt.Appendf(nil, "val%08d", i)
-			if err := ref.Put(key, val); err != nil {
+			if err := ref.Put(context.Background(), key, val); err != nil {
 				t.Fatalf("Put %d: %v", i, err)
 			}
 		}
-		ref.Sync()
+		ref.Sync(context.Background())
 		db.Close()
 	}
 	{
@@ -308,7 +311,7 @@ func TestSyncReopenLarge(t *testing.T) {
 		for i := range n {
 			key := fmt.Appendf(nil, "key%08d", i)
 			want := string(fmt.Appendf(nil, "val%08d", i))
-			got, err := ref.Get(key)
+			got, err := ref.Get(context.Background(), key)
 			if err != nil {
 				t.Fatalf("Get %d: %v", i, err)
 			}
@@ -332,11 +335,11 @@ func TestIteratorAfterSync(t *testing.T) {
 		key := fmt.Appendf(nil, "k%05d", i)
 		val := fmt.Appendf(nil, "v%05d", i)
 		keys = append(keys, string(key))
-		if err := ref.Put(key, val); err != nil {
+		if err := ref.Put(context.Background(), key, val); err != nil {
 			t.Fatal(err)
 		}
 	}
-	ref.Sync()
+	ref.Sync(context.Background())
 	sort.Strings(keys)
 
 	it := ref.NewIterator()
@@ -372,15 +375,15 @@ func TestWriteBatch(t *testing.T) {
 	batch.Put(t1, []byte("key1"), []byte("val1"))
 	batch.Put(t2, []byte("key2"), []byte("val2"))
 	batch.Delete(t1, []byte("gone"))
-	if ok, err := batch.Commit(); err != nil || !ok {
+	if ok, err := batch.Commit(context.Background()); err != nil || !ok {
 		t.Fatalf("Commit: ok=%v err=%v", ok, err)
 	}
 
-	v1, err := t1.NewRef().Get([]byte("key1"))
+	v1, err := t1.NewRef().Get(context.Background(), []byte("key1"))
 	if err != nil || string(v1) != "val1" {
 		t.Fatalf("t1 key1: got %q err %v", v1, err)
 	}
-	v2, err := t2.NewRef().Get([]byte("key2"))
+	v2, err := t2.NewRef().Get(context.Background(), []byte("key2"))
 	if err != nil || string(v2) != "val2" {
 		t.Fatalf("t2 key2: got %q err %v", v2, err)
 	}
@@ -394,9 +397,9 @@ func TestSeqMonotonic(t *testing.T) {
 	ref := tbl.NewRef()
 
 	s0 := db.Seq()
-	ref.Put([]byte("a"), []byte("1"))
+	ref.Put(context.Background(), []byte("a"), []byte("1"))
 	s1 := db.Seq()
-	ref.Put([]byte("b"), []byte("2"))
+	ref.Put(context.Background(), []byte("b"), []byte("2"))
 	s2 := db.Seq()
 	if !(s0 < s1 && s1 < s2) {
 		t.Fatalf("seq not monotonic: %d %d %d", s0, s1, s2)
@@ -405,14 +408,14 @@ func TestSeqMonotonic(t *testing.T) {
 	batch := db.NewBatch()
 	batch.Put(tbl, []byte("c"), []byte("3"))
 	batch.Put(tbl, []byte("d"), []byte("4"))
-	batch.Commit()
+	batch.Commit(context.Background())
 	s3 := db.Seq()
 	if s3 <= s2 {
 		t.Fatalf("batch did not advance seq: %d → %d", s2, s3)
 	}
 
 	// Reopen: seq must be restored to at least s3.
-	ref.Sync()
+	ref.Sync(context.Background())
 	db.Close()
 
 	db2 := mustOpenDB(t, dir)
@@ -432,8 +435,8 @@ func TestConditionalBatch(t *testing.T) {
 	r1 := t1.NewRef()
 	r2 := t2.NewRef()
 
-	r1.Put([]byte("a"), []byte("1"))
-	r2.Put([]byte("b"), []byte("2"))
+	r1.Put(context.Background(), []byte("a"), []byte("1"))
+	r2.Put(context.Background(), []byte("b"), []byte("2"))
 
 	// Batch with correct conditions → should commit.
 	batch := db.NewBatch()
@@ -441,14 +444,14 @@ func TestConditionalBatch(t *testing.T) {
 	batch.Check(t2, []byte("b"), []byte("2"))
 	batch.Put(t1, []byte("a"), []byte("1x"))
 	batch.Put(t2, []byte("b"), []byte("2x"))
-	ok, err := batch.Commit()
+	ok, err := batch.Commit(context.Background())
 	if err != nil || !ok {
 		t.Fatalf("Commit (all match): ok=%v err=%v", ok, err)
 	}
-	if v, _ := r1.Get([]byte("a")); string(v) != "1x" {
+	if v, _ := r1.Get(context.Background(), []byte("a")); string(v) != "1x" {
 		t.Errorf("t1.a: want 1x, got %q", v)
 	}
-	if v, _ := r2.Get([]byte("b")); string(v) != "2x" {
+	if v, _ := r2.Get(context.Background(), []byte("b")); string(v) != "2x" {
 		t.Errorf("t2.b: want 2x, got %q", v)
 	}
 
@@ -458,14 +461,14 @@ func TestConditionalBatch(t *testing.T) {
 	batch2.Check(t2, []byte("b"), []byte("2x")) // correct
 	batch2.Put(t1, []byte("a"), []byte("nope"))
 	batch2.Put(t2, []byte("b"), []byte("nope"))
-	ok, err = batch2.Commit()
+	ok, err = batch2.Commit(context.Background())
 	if err != nil || ok {
 		t.Fatalf("Commit (one mismatch): ok=%v err=%v", ok, err)
 	}
-	if v, _ := r1.Get([]byte("a")); string(v) != "1x" {
+	if v, _ := r1.Get(context.Background(), []byte("a")); string(v) != "1x" {
 		t.Errorf("t1.a after failed batch: want 1x, got %q", v)
 	}
-	if v, _ := r2.Get([]byte("b")); string(v) != "2x" {
+	if v, _ := r2.Get(context.Background(), []byte("b")); string(v) != "2x" {
 		t.Errorf("t2.b after failed batch: want 2x, got %q", v)
 	}
 
@@ -473,11 +476,11 @@ func TestConditionalBatch(t *testing.T) {
 	batch3 := db.NewBatch()
 	batch3.Check(t1, []byte("new"), nil) // must be absent
 	batch3.Put(t1, []byte("new"), []byte("hello"))
-	ok, err = batch3.Commit()
+	ok, err = batch3.Commit(context.Background())
 	if err != nil || !ok {
 		t.Fatalf("Commit (absent check): ok=%v err=%v", ok, err)
 	}
-	if v, _ := r1.Get([]byte("new")); string(v) != "hello" {
+	if v, _ := r1.Get(context.Background(), []byte("new")); string(v) != "hello" {
 		t.Errorf("t1.new: want hello, got %q", v)
 	}
 }
@@ -489,18 +492,18 @@ func TestConditionalBatchAfterSync(t *testing.T) {
 
 	tbl := mustTable(t, db, "t")
 	ref := tbl.NewRef()
-	ref.Put([]byte("k"), []byte("v1"))
-	ref.Sync()
+	ref.Put(context.Background(), []byte("k"), []byte("v1"))
+	ref.Sync(context.Background())
 
 	// Value is on disk; condition should still see it.
 	batch := db.NewBatch()
 	batch.Check(tbl, []byte("k"), []byte("v1"))
 	batch.Put(tbl, []byte("k"), []byte("v2"))
-	ok, err := batch.Commit()
+	ok, err := batch.Commit(context.Background())
 	if err != nil || !ok {
 		t.Fatalf("Commit after sync: ok=%v err=%v", ok, err)
 	}
-	if v, _ := ref.Get([]byte("k")); string(v) != "v2" {
+	if v, _ := ref.Get(context.Background(), []byte("k")); string(v) != "v2" {
 		t.Errorf("after conditional batch post-sync: want v2, got %q", v)
 	}
 }
@@ -513,11 +516,11 @@ func TestMultipleTables(t *testing.T) {
 	t1 := mustTable(t, db, "t1")
 	t2 := mustTable(t, db, "t2")
 
-	t1.NewRef().Put([]byte("key"), []byte("val1"))
-	t2.NewRef().Put([]byte("key"), []byte("val2"))
+	t1.NewRef().Put(context.Background(), []byte("key"), []byte("val1"))
+	t2.NewRef().Put(context.Background(), []byte("key"), []byte("val2"))
 
-	v1, _ := t1.NewRef().Get([]byte("key"))
-	v2, _ := t2.NewRef().Get([]byte("key"))
+	v1, _ := t1.NewRef().Get(context.Background(), []byte("key"))
+	v2, _ := t2.NewRef().Get(context.Background(), []byte("key"))
 
 	if string(v1) != "val1" {
 		t.Errorf("t1: want val1, got %q", v1)
@@ -545,47 +548,47 @@ func TestUpdateCAS(t *testing.T) {
 	key := []byte("k")
 
 	// Update on absent key with nil oldValue → should apply (insert).
-	ok, err := ref.Update(key, nil, []byte("v1"))
+	ok, err := ref.Update(context.Background(), key, nil, []byte("v1"))
 	if err != nil || !ok {
 		t.Fatalf("Update nil→v1: ok=%v err=%v", ok, err)
 	}
-	got, _ := ref.Get(key)
+	got, _ := ref.Get(context.Background(), key)
 	if string(got) != "v1" {
 		t.Fatalf("after insert: got %q, want v1", got)
 	}
 
 	// Update with wrong oldValue → should not apply.
-	ok, err = ref.Update(key, []byte("wrong"), []byte("v2"))
+	ok, err = ref.Update(context.Background(), key, []byte("wrong"), []byte("v2"))
 	if err != nil || ok {
 		t.Fatalf("Update wrong oldValue: ok=%v err=%v", ok, err)
 	}
-	got, _ = ref.Get(key)
+	got, _ = ref.Get(context.Background(), key)
 	if string(got) != "v1" {
 		t.Fatalf("after failed update: got %q, want v1", got)
 	}
 
 	// Update with correct oldValue → should apply.
-	ok, err = ref.Update(key, []byte("v1"), []byte("v2"))
+	ok, err = ref.Update(context.Background(), key, []byte("v1"), []byte("v2"))
 	if err != nil || !ok {
 		t.Fatalf("Update v1→v2: ok=%v err=%v", ok, err)
 	}
-	got, _ = ref.Get(key)
+	got, _ = ref.Get(context.Background(), key)
 	if string(got) != "v2" {
 		t.Fatalf("after update: got %q, want v2", got)
 	}
 
 	// Update with nil newValue → delete.
-	ok, err = ref.Update(key, []byte("v2"), nil)
+	ok, err = ref.Update(context.Background(), key, []byte("v2"), nil)
 	if err != nil || !ok {
 		t.Fatalf("Update v2→nil: ok=%v err=%v", ok, err)
 	}
-	got, _ = ref.Get(key)
+	got, _ = ref.Get(context.Background(), key)
 	if got != nil {
 		t.Fatalf("after delete via Update: got %q, want nil", got)
 	}
 
 	// Update on absent key with non-nil oldValue → should not apply.
-	ok, err = ref.Update(key, []byte("v2"), []byte("v3"))
+	ok, err = ref.Update(context.Background(), key, []byte("v2"), []byte("v3"))
 	if err != nil || ok {
 		t.Fatalf("Update on absent key with non-nil oldValue: ok=%v err=%v", ok, err)
 	}
@@ -600,15 +603,15 @@ func TestUpdateCASAfterSync(t *testing.T) {
 	ref := tbl.NewRef()
 	key := []byte("k")
 
-	ref.Put(key, []byte("v1"))
-	ref.Sync()
+	ref.Put(context.Background(), key, []byte("v1"))
+	ref.Sync(context.Background())
 
 	// Value is now on disk. CAS should still see it.
-	ok, err := ref.Update(key, []byte("v1"), []byte("v2"))
+	ok, err := ref.Update(context.Background(), key, []byte("v1"), []byte("v2"))
 	if err != nil || !ok {
 		t.Fatalf("Update after sync: ok=%v err=%v", ok, err)
 	}
-	got, _ := ref.Get(key)
+	got, _ := ref.Get(context.Background(), key)
 	if string(got) != "v2" {
 		t.Fatalf("after update post-sync: got %q, want v2", got)
 	}
@@ -620,9 +623,9 @@ func TestDropTable(t *testing.T) {
 	defer db.Close()
 
 	tbl := mustTable(t, db, "items")
-	tbl.NewRef().Put([]byte("k1"), []byte("v1"))
+	tbl.NewRef().Put(context.Background(), []byte("k1"), []byte("v1"))
 
-	if err := db.DropTable("items"); err != nil {
+	if err := db.DropTable(context.Background(), "items"); err != nil {
 		t.Fatalf("DropTable: %v", err)
 	}
 
@@ -658,12 +661,12 @@ func TestBlobPutGet(t *testing.T) {
 	}
 	key := []byte("bigkey")
 
-	if err := ref.Put(key, large); err != nil {
+	if err := ref.Put(context.Background(), key, large); err != nil {
 		t.Fatalf("Put large: %v", err)
 	}
 
 	// Read back from the memtable (pre-flush).
-	got, err := ref.Get(key)
+	got, err := ref.Get(context.Background(), key)
 	if err != nil {
 		t.Fatalf("Get (memtable): %v", err)
 	}
@@ -672,8 +675,8 @@ func TestBlobPutGet(t *testing.T) {
 	}
 
 	// Force flush to flexfile and read back from disk.
-	db.Sync()
-	got2, err := ref.Get(key)
+	db.Sync(context.Background())
+	got2, err := ref.Get(context.Background(), key)
 	if err != nil {
 		t.Fatalf("Get (disk): %v", err)
 	}
@@ -696,7 +699,7 @@ func TestBlobReopen(t *testing.T) {
 	{
 		db := mustOpenDB(t, dir)
 		tbl := mustTable(t, db, "t")
-		if err := tbl.NewRef().Put(key, large); err != nil {
+		if err := tbl.NewRef().Put(context.Background(), key, large); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 		db.Close()
@@ -707,7 +710,7 @@ func TestBlobReopen(t *testing.T) {
 		db := mustOpenDB(t, dir)
 		defer db.Close()
 		tbl := mustTable(t, db, "t")
-		got, err := tbl.NewRef().Get(key)
+		got, err := tbl.NewRef().Get(context.Background(), key)
 		if err != nil {
 			t.Fatalf("Get after reopen: %v", err)
 		}
@@ -740,11 +743,11 @@ func TestBlobIterator(t *testing.T) {
 	}
 
 	for k, v := range blobs {
-		if err := ref.Put([]byte(k), v); err != nil {
+		if err := ref.Put(context.Background(), []byte(k), v); err != nil {
 			t.Fatalf("Put %q: %v", k, err)
 		}
 	}
-	db.Sync()
+	db.Sync(context.Background())
 
 	it := ref.NewIterator()
 	defer it.Close()
@@ -782,16 +785,16 @@ func TestBlobDelete(t *testing.T) {
 	large := make([]byte, MaxKVSize+1)
 	key := []byte("toDelete")
 
-	if err := ref.Put(key, large); err != nil {
+	if err := ref.Put(context.Background(), key, large); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	if err := ref.Delete(key); err != nil {
+	if err := ref.Delete(context.Background(), key); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 
-	db.Sync()
+	db.Sync(context.Background())
 
-	got, err := ref.Get(key)
+	got, err := ref.Get(context.Background(), key)
 	if err != nil {
 		t.Fatalf("Get after delete: %v", err)
 	}
@@ -819,7 +822,7 @@ func TestBlobBatch(t *testing.T) {
 	batch.Put(tbl, []byte("small"), []byte("tiny"))
 	batch.Put(tbl, []byte("large"), large)
 
-	ok, err := batch.Commit()
+	ok, err := batch.Commit(context.Background())
 	if err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
@@ -827,9 +830,9 @@ func TestBlobBatch(t *testing.T) {
 		t.Fatal("Commit returned false")
 	}
 
-	db.Sync()
+	db.Sync(context.Background())
 
-	got, err := ref.Get([]byte("large"))
+	got, err := ref.Get(context.Background(), []byte("large"))
 	if err != nil {
 		t.Fatalf("Get large: %v", err)
 	}
