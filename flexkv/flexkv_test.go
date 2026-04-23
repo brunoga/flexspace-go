@@ -1,6 +1,7 @@
 package flexkv
 
 import (
+	"context"
 	"os"
 	"testing"
 )
@@ -9,7 +10,9 @@ func openTestDB(t *testing.T, path string) *DB {
 	t.Helper()
 	os.RemoveAll(path)
 	t.Cleanup(func() { os.RemoveAll(path) })
-	db, err := Open(path, &Options{CacheMB: 64})
+	opts := DefaultOptions()
+	opts.CacheMB = 64
+	db, err := Open(context.Background(), path, opts)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -19,7 +22,7 @@ func openTestDB(t *testing.T, path string) *DB {
 
 func mustTable(t *testing.T, db *DB, name string) *Table {
 	t.Helper()
-	tbl, err := db.Table(name)
+	tbl, err := db.Table(context.Background(), name)
 	if err != nil {
 		t.Fatalf("Table(%q): %v", name, err)
 	}
@@ -28,14 +31,14 @@ func mustTable(t *testing.T, db *DB, name string) *Table {
 
 func mustPut(t *testing.T, tbl *Table, key, value string) {
 	t.Helper()
-	if err := tbl.Put([]byte(key), []byte(value)); err != nil {
+	if err := tbl.Put(context.Background(), []byte(key), []byte(value)); err != nil {
 		t.Fatalf("Put(%q, %q): %v", key, value, err)
 	}
 }
 
 func mustDelete(t *testing.T, tbl *Table, key string) {
 	t.Helper()
-	if err := tbl.Delete([]byte(key)); err != nil {
+	if err := tbl.Delete(context.Background(), []byte(key)); err != nil {
 		t.Fatalf("Delete(%q): %v", key, err)
 	}
 }
@@ -54,7 +57,7 @@ func TestPutGetDelete(t *testing.T) {
 
 	mustPut(t, tbl, "u1", "Alice")
 
-	val, err := tbl.Get([]byte("u1"))
+	val, err := tbl.Get(context.Background(), []byte("u1"))
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -64,7 +67,7 @@ func TestPutGetDelete(t *testing.T) {
 
 	mustDelete(t, tbl, "u1")
 
-	val, err = tbl.Get([]byte("u1"))
+	val, err = tbl.Get(context.Background(), []byte("u1"))
 	if err != nil {
 		t.Fatalf("Get after Delete: %v", err)
 	}
@@ -100,7 +103,7 @@ func TestIndexScan(t *testing.T) {
 	db := openTestDB(t, "test_index")
 	tbl := mustTable(t, db, "users")
 
-	if err := tbl.CreateIndex("first_letter", firstLetterIndexer); err != nil {
+	if err := tbl.CreateIndex(context.Background(), "first_letter", firstLetterIndexer); err != nil {
 		t.Fatalf("CreateIndex: %v", err)
 	}
 
@@ -125,7 +128,7 @@ func TestIndexScan(t *testing.T) {
 	count := 0
 	for ; it.Valid(); it.Next() {
 		pk := string(it.PrimaryKey())
-		val, err := it.GetRecord()
+		val, err := it.GetRecord(context.Background())
 		if err != nil {
 			t.Fatalf("GetRecord: %v", err)
 		}
@@ -143,7 +146,7 @@ func TestIndexScanVariableLengthValues(t *testing.T) {
 	db := openTestDB(t, "test_index_varlen")
 	tbl := mustTable(t, db, "items")
 
-	if err := tbl.CreateIndex("name", func(_, v []byte) [][]byte {
+	if err := tbl.CreateIndex(context.Background(), "name", func(_, v []byte) [][]byte {
 		return [][]byte{v}
 	}); err != nil {
 		t.Fatalf("CreateIndex: %v", err)
@@ -170,7 +173,7 @@ func TestIndexUpdate(t *testing.T) {
 	db := openTestDB(t, "test_index_update")
 	tbl := mustTable(t, db, "users")
 
-	if err := tbl.CreateIndex("first_letter", firstLetterIndexer); err != nil {
+	if err := tbl.CreateIndex(context.Background(), "first_letter", firstLetterIndexer); err != nil {
 		t.Fatalf("CreateIndex: %v", err)
 	}
 
@@ -207,11 +210,11 @@ func TestMultipleTables(t *testing.T) {
 	mustPut(t, t1, "key", "val1")
 	mustPut(t, t2, "key", "val2")
 
-	v1, err := t1.Get([]byte("key"))
+	v1, err := t1.Get(context.Background(), []byte("key"))
 	if err != nil {
 		t.Fatalf("t1.Get: %v", err)
 	}
-	v2, err := t2.Get([]byte("key"))
+	v2, err := t2.Get(context.Background(), []byte("key"))
 	if err != nil {
 		t.Fatalf("t2.Get: %v", err)
 	}
@@ -236,14 +239,14 @@ func TestDropTable(t *testing.T) {
 	db := openTestDB(t, "test_drop")
 
 	tbl := mustTable(t, db, "items")
-	if err := tbl.CreateIndex("first_letter", firstLetterIndexer); err != nil {
+	if err := tbl.CreateIndex(context.Background(), "first_letter", firstLetterIndexer); err != nil {
 		t.Fatalf("CreateIndex: %v", err)
 	}
 
 	mustPut(t, tbl, "k1", "Apple")
 	mustPut(t, tbl, "k2", "Banana")
 
-	if err := db.DropTable("items"); err != nil {
+	if err := db.DropTable(context.Background(), "items"); err != nil {
 		t.Fatalf("DropTable: %v", err)
 	}
 
@@ -257,6 +260,7 @@ func TestDropTable(t *testing.T) {
 
 	// Recreate: should be empty.
 	tbl2 := mustTable(t, db, "items")
+	_ = tbl2
 	it := tbl2.Scan(nil, nil)
 	defer it.Close()
 	if it.Valid() {

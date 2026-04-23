@@ -34,13 +34,15 @@ flexkv (caller)
 ## Write Path
 
 ```
-TableRef.Put(key, value)
+TableRef.Put(ctx, key, value)
   │
+  ├─ check ctx.Done()
   ├─ hash key → shard lock (one of 16)
   ├─ increment seqNum (atomic)
   ├─ append KV record to active memtable WAL buffer
   ├─ insert into skip list (ordered map)
   └─ release shard lock
+```
 
 Background flush worker (every 5 s or when memtable ≥ 1 GiB):
   ├─ acquire all 16 shard locks simultaneously
@@ -52,14 +54,16 @@ Background flush worker (every 5 s or when memtable ≥ 1 GiB):
 ```
 
 The key insight: writers never block on disk I/O. They write to the memtable (RAM + buffered WAL) and return. Disk flushes happen in the background, overlapping with subsequent writes.
-
 ## Read Path
 
 ```
-TableRef.Get(key)
+TableRef.Get(ctx, key)
+  ├─ check ctx.Done()
   ├─ probe active memtable (skip list lookup)
   ├─ probe immutable memtable (may be flushing, but still readable)
   └─ if not found in either:
+```
+
       ├─ find anchor via sparse B+tree (findAnchorPos)
       ├─ check cache partition (1 of 1024 shards)
       │   ├─ cache HIT  → linear search with SIMD-style fingerprint scan
@@ -159,7 +163,7 @@ batch.Check(table, key, expected)
 batch.Put(table1, key, value)
 batch.Delete(table2, key)
 
-seq, err := batch.Commit()
+committed, err := batch.Commit(ctx)
 ```
 
 `Commit` acquires all 16 memtable shard locks simultaneously, evaluates all `Check` conditions, and if they all pass, applies all mutations as a single WAL record. Either the entire batch is committed or none of it is.
@@ -219,14 +223,15 @@ ts := table.Stats()
 ## Public API
 
 ```go
-// Open or create a database. capMB is the per-table cache budget.
-func Open(path string, capMB uint64) (*DB, error)
+// Open or create a database.
+func Open(ctx context.Context, path string, opts *Options) (*DB, error)
+
 
 // Table opens or creates a named table. Identical names return the same handle.
-func (db *DB) Table(name string) (*Table, error)
+func (db *DB) Table(ctx context.Context, name string) (*Table, error)
 
 // DropTable removes a table and all its data in O(1).
-func (db *DB) DropTable(name string) error
+func (db *DB) DropTable(ctx context.Context, name string) error
 
 // Tables returns sorted names of all open tables.
 func (db *DB) Tables() ([]string, error)
@@ -240,8 +245,11 @@ func (db *DB) Seq() uint64
 // Stats returns a snapshot of DB-level statistics.
 func (db *DB) Stats() DBStats
 
+// Metrics returns current performance counters.
+func (db *DB) Metrics() MetricsSnapshot
+
 // Sync forces a full flush of all pending writes to disk.
-func (db *DB) Sync() error
+func (db *DB) Sync(ctx context.Context) error
 
 // Close flushes everything and releases resources.
 func (db *DB) Close() error
@@ -253,8 +261,9 @@ func (t *Table) NewRef() *TableRef
 func (t *Table) Stats() TableStats
 
 // TableRef methods:
-func (r *TableRef) Put(key, value []byte) error
-func (r *TableRef) Get(key []byte) ([]byte, error)
-func (r *TableRef) Probe(key []byte) bool
+func (r *TableRef) Put(ctx context.Context, key, value []byte) error
+func (r *TableRef) Get(ctx context.Context, key []byte) ([]byte, error)
+func (r *TableRef) Probe(ctx context.Context, key []byte) (bool, error)
+func (r *TableRef) Update(ctx context.Context, key, oldValue, newValue []byte) (bool, error)
 func (r *TableRef) NewIterator() *Iterator
 ```

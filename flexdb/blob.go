@@ -39,8 +39,9 @@ type blobStore struct {
 // openBlobStore opens (or creates) the blob file at dir/BLOBFILE.
 func openBlobStore(dir string) (*blobStore, error) {
 	path := filepath.Join(dir, "BLOBFILE")
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
+
 		return nil, fmt.Errorf("open blob file: %w", err)
 	}
 

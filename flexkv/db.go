@@ -19,6 +19,7 @@ package flexkv
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"sort"
 	"sync"
@@ -41,13 +42,21 @@ type Options struct {
 	CacheMB uint64 // per-table cache budget in MB (default: 64)
 }
 
-// Open opens or creates a flexkv database at path.
-func Open(path string, opts *Options) (*DB, error) {
-	capMB := uint64(64)
-	if opts != nil && opts.CacheMB > 0 {
-		capMB = opts.CacheMB
+// DefaultOptions returns a set of sensible default options.
+func DefaultOptions() *Options {
+	return &Options{
+		CacheMB: 64,
 	}
-	fdb, err := flexdb.Open(path, capMB)
+}
+
+// Open opens or creates a flexkv database at path.
+func Open(ctx context.Context, path string, opts *Options) (*DB, error) {
+	if opts == nil {
+		opts = DefaultOptions()
+	}
+	fdbOpts := flexdb.DefaultOptions()
+	fdbOpts.CacheMB = opts.CacheMB
+	fdb, err := flexdb.Open(ctx, path, fdbOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -66,8 +75,8 @@ func (db *DB) RawDB() *flexdb.DB {
 
 // Table opens or creates a named table. Multiple calls with the same name
 // return equivalent handles.
-func (db *DB) Table(name string) (*Table, error) {
-	dt, err := db.fdb.Table(name)
+func (db *DB) Table(ctx context.Context, name string) (*Table, error) {
+	dt, err := db.fdb.Table(ctx, name)
 	if err != nil {
 		return nil, fmt.Errorf("flexkv: table %q data: %w", name, err)
 	}
@@ -81,9 +90,9 @@ func (db *DB) Table(name string) (*Table, error) {
 }
 
 // DropTable removes the data table and all index tables for name (O(1) in data size).
-func (db *DB) DropTable(name string) error {
+func (db *DB) DropTable(ctx context.Context, name string) error {
 	// Drop data table.
-	if err := db.fdb.DropTable(name); err != nil {
+	if err := db.fdb.DropTable(ctx, name); err != nil {
 		return fmt.Errorf("flexkv: drop table %q: %w", name, err)
 	}
 	// Drop all index tables with the prefix "name.$".
@@ -94,7 +103,7 @@ func (db *DB) DropTable(name string) error {
 	prefix := name + ".$"
 	for _, t := range all {
 		if len(t) > len(prefix) && t[:len(prefix)] == prefix {
-			if err := db.fdb.DropTable(t); err != nil {
+			if err := db.fdb.DropTable(ctx, t); err != nil {
 				return fmt.Errorf("flexkv: drop index table %q: %w", t, err)
 			}
 		}
@@ -143,12 +152,12 @@ type Table struct {
 
 // indexFDBTable returns or opens the flexdb table for the given index.
 // Caller must hold t.mu in write mode.
-func (t *Table) indexFDBTable(indexName string) (*flexdb.Table, error) {
+func (t *Table) indexFDBTable(ctx context.Context, indexName string) (*flexdb.Table, error) {
 	if ft, ok := t.indexFDB[indexName]; ok {
 		return ft, nil
 	}
 	fdbName := t.name + ".$" + indexName
-	ft, err := t.db.fdb.Table(fdbName)
+	ft, err := t.db.fdb.Table(ctx, fdbName)
 	if err != nil {
 		return nil, err
 	}
@@ -164,7 +173,7 @@ type indexEntry struct {
 
 // Put inserts or updates a key-value pair, maintaining all registered indexes atomically.
 // Pass nil value to delete (equivalent to Delete).
-func (t *Table) Put(key, value []byte) error {
+func (t *Table) Put(ctx context.Context, key, value []byte) error {
 	// Snapshot all index state while holding the read lock.
 	t.mu.RLock()
 	indexes := make(map[string]indexEntry, len(t.indexers))
@@ -177,7 +186,7 @@ func (t *Table) Put(key, value []byte) error {
 	var oldValue []byte
 	if len(indexes) > 0 {
 		var err error
-		oldValue, err = t.dataFDB.NewRef().Get(key)
+		oldValue, err = t.dataFDB.NewRef().Get(ctx, key)
 		if err != nil {
 			return err
 		}
@@ -207,37 +216,37 @@ func (t *Table) Put(key, value []byte) error {
 		batch.Delete(t.dataFDB, key)
 	}
 
-	_, err := batch.Commit()
+	_, err := batch.Commit(ctx)
 	return err
 }
 
 // Get retrieves a value by primary key. Returns (nil, nil) if not found.
-func (t *Table) Get(key []byte) ([]byte, error) {
-	return t.dataFDB.NewRef().Get(key)
+func (t *Table) Get(ctx context.Context, key []byte) ([]byte, error) {
+	return t.dataFDB.NewRef().Get(ctx, key)
 }
 
 // Delete removes a key-value pair, cleaning up index entries.
-func (t *Table) Delete(key []byte) error {
-	return t.Put(key, nil)
+func (t *Table) Delete(ctx context.Context, key []byte) error {
+	return t.Put(ctx, key, nil)
 }
 
 // RegisterIndex re-attaches an indexer function to an index whose data is
 // already on disk. Unlike CreateIndex it does not scan existing records —
 // use this on restart to restore indexers without redundant work.
-func (t *Table) RegisterIndex(name string, indexer Indexer) error {
+func (t *Table) RegisterIndex(ctx context.Context, name string, indexer Indexer) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.indexers[name] = indexer
-	_, err := t.indexFDBTable(name)
+	_, err := t.indexFDBTable(ctx, name)
 	return err
 }
 
 // CreateIndex registers indexer under name and populates it from existing records.
 // Safe to call concurrently with other operations.
-func (t *Table) CreateIndex(name string, indexer Indexer) error {
+func (t *Table) CreateIndex(ctx context.Context, name string, indexer Indexer) error {
 	t.mu.Lock()
 	t.indexers[name] = indexer
-	ft, err := t.indexFDBTable(name)
+	ft, err := t.indexFDBTable(ctx, name)
 	t.mu.Unlock()
 	if err != nil {
 		return err
@@ -248,12 +257,17 @@ func (t *Table) CreateIndex(name string, indexer Indexer) error {
 	defer it.Close()
 
 	for ; it.Valid(); it.Next() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		key := it.Key()
 		value := it.Value()
 		for _, v := range indexer(key, value) {
 			batch := t.db.fdb.NewBatch()
 			batch.Put(ft, encodeIndexKey(v, key), []byte{1})
-			if _, err := batch.Commit(); err != nil {
+			if _, err := batch.Commit(ctx); err != nil {
 				return err
 			}
 		}
@@ -277,14 +291,14 @@ func (t *Table) RawIndexTable(name string) (*flexdb.Table, bool) {
 }
 
 // DropIndex removes an index (O(1) via flexdb.DropTable).
-func (t *Table) DropIndex(name string) error {
+func (t *Table) DropIndex(ctx context.Context, name string) error {
 	t.mu.Lock()
 	delete(t.indexers, name)
 	delete(t.indexFDB, name)
 	t.mu.Unlock()
 
 	fdbName := t.name + ".$" + name
-	return t.db.fdb.DropTable(fdbName)
+	return t.db.fdb.DropTable(ctx, fdbName)
 }
 
 // Scan returns an iterator over [start, end) on primary keys.
@@ -362,7 +376,7 @@ type Index struct {
 func (idx *Index) fdbTable() (*flexdb.Table, error) {
 	idx.t.mu.Lock()
 	defer idx.t.mu.Unlock()
-	return idx.t.indexFDBTable(idx.name)
+	return idx.t.indexFDBTable(context.Background(), idx.name)
 }
 
 // Scan returns an iterator over index entries whose indexed value is in [start, end).
@@ -493,12 +507,12 @@ func (it *IndexIterator) PrimaryKey() []byte {
 }
 
 // GetRecord fetches the full value for the current index entry by primary key.
-func (it *IndexIterator) GetRecord() ([]byte, error) {
+func (it *IndexIterator) GetRecord(ctx context.Context) ([]byte, error) {
 	pk := it.PrimaryKey()
 	if pk == nil {
-		return nil, fmt.Errorf("flexkv: invalid index entry")
+		return nil, ErrInvalidIndexEntry
 	}
-	return it.t.Get(pk)
+	return it.t.Get(ctx, pk)
 }
 
 // ---- Index key encoding ----

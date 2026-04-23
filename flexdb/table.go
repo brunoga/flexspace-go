@@ -1,12 +1,15 @@
 package flexdb
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
+
+	"github.com/brunoga/flexspace-go/flexfile"
 )
 
 // Table is a named, isolated key-value namespace within a DB.
@@ -54,11 +57,12 @@ func tableDir(dbPath string, id uint32) string {
 }
 
 // openTable opens or creates a table with the given ID and name.
-func (db *DB) openTable(id uint32, name string) (*Table, error) {
+func (db *DB) openTable(ctx context.Context, id uint32, name string) (*Table, error) {
 	dir := tableDir(db.path, id)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, fmt.Errorf("openTable %q: mkdir: %w", name, err)
 	}
+
 	ff, err := openStorage(filepath.Join(dir, "FLEXFILE"))
 	if err != nil {
 		return nil, fmt.Errorf("openTable %q: flexfile: %w", name, err)
@@ -78,15 +82,29 @@ func (db *DB) openTable(id uint32, name string) (*Table, error) {
 		itvbuf: make([]byte, (sparseInterval*MaxKVSize)+MaxKVSize),
 	}
 	t.tree = newDBTree()
-	t.cache = newDBCache(ff, db.capMB)
+	t.cache = newDBCache(db, ff, db.capMB)
+
+	ff.SetMetrics(flexfile.Metrics{
+		WALWriteCount:    &db.metrics.WALWriteCount,
+		GCReclaimedBytes: &db.metrics.GCReclaimedBytes,
+		GCMovedBytes:     &db.metrics.GCMovedBytes,
+	})
 
 	if ff.Size() == 0 {
+
 		if err := t.initSentinel(); err != nil {
 			ff.Close()
 			blobs.close()
 			return nil, fmt.Errorf("openTable %q: init sentinel: %w", name, err)
 		}
 	} else {
+		select {
+		case <-ctx.Done():
+			ff.Close()
+			blobs.close()
+			return nil, ctx.Err()
+		default:
+		}
 		if err := t.rebuildIndex(); err != nil {
 			ff.Close()
 			blobs.close()
@@ -147,6 +165,7 @@ func (t *Table) initSentinel() error {
 // rebuildIndex scans the table's flexfile and rebuilds the in-memory anchor tree.
 func (t *Table) rebuildIndex() error {
 	totalSize := t.ff.Size()
+
 	if totalSize == 0 {
 		return nil
 	}
@@ -245,6 +264,7 @@ func (t *Table) exitFF(id uint32) {
 
 func (t *Table) getPassthrough(key, itvbuf []byte, fp uint16) []byte {
 	nh := t.tree.findAnchorPos(key)
+
 	a := nh.node.anchors[nh.idx]
 	loff := uint64(a.loff) + uint64(nh.shift)
 
@@ -261,6 +281,7 @@ func (t *Table) getPassthrough(key, itvbuf []byte, fp uint16) []byte {
 
 func (t *Table) probePassthrough(key, itvbuf []byte, fp uint16) bool {
 	nh := t.tree.findAnchorPos(key)
+
 	a := nh.node.anchors[nh.idx]
 	loff := uint64(a.loff) + uint64(nh.shift)
 
@@ -323,6 +344,7 @@ func (t *Table) putPassthrough(kv *KV, nh *nodeHandler) error {
 
 func (t *Table) putPassthroughUnsorted(kv *KV, nh *nodeHandler, a *anchor) error {
 	anchorLoff := uint64(a.loff) + uint64(nh.shift)
+
 	n := encodeKV128(t.kvbuf, kv)
 	psize := uint32(n)
 	loff := anchorLoff + uint64(a.psize)
@@ -410,6 +432,7 @@ func (t *Table) putPassthroughCached(kv *KV, nh *nodeHandler, a *anchor, p *cach
 
 func (t *Table) rewriteInterval(nh *nodeHandler, a *anchor, e *cacheEntry) error {
 	anchorLoff := uint64(a.loff) + uint64(nh.shift)
+
 	off := 0
 	for i := 0; i < e.count; i++ {
 		n := encodeKV128(t.itvbuf[off:], e.kvs[i])
@@ -498,6 +521,7 @@ func (t *Table) splitAnchor(nh *nodeHandler, p *cachePartition, e *cacheEntry) e
 
 func (t *Table) deletePassthrough(key []byte, nh *nodeHandler, fp uint16) error {
 	t.tree.nextAnchor(nh, key)
+
 	a := nh.node.anchors[nh.idx]
 	anchorLoff := uint64(a.loff) + uint64(nh.shift)
 

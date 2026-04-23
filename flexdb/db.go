@@ -10,6 +10,7 @@
 package flexdb
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // DB is the top-level FlexDB database manager. It holds a table registry and
@@ -25,7 +27,11 @@ type DB struct {
 	path  string
 	capMB uint64
 
+	memtableCap int64
+	flushInter  time.Duration
+
 	// Table registry (protected by tablesMu).
+
 	tablesMu     sync.RWMutex
 	tablesByName map[string]*Table
 	tablesByID   map[uint32]*Table
@@ -49,20 +55,53 @@ type DB struct {
 	// write (single-op or batch). Stored in WAL records; restored on replay.
 	// Enables MVCC and conflict detection without format migration later.
 	seqNum atomic.Uint64
+
+	// performance metrics
+	metrics Metrics
 }
 
-const lockShards = 16
+const (
+	lockShards = 16
+
+	tableRegistryMagic   = 0x464C5852 // 'FLXR'
+	tableRegistryVersion = 1
+)
+
+// Options contains configuration for a FlexDB instance.
+type Options struct {
+	// CacheMB is the per-table in-memory cache capacity in megabytes (default: 64).
+	CacheMB uint64
+
+	// MemtableCap is the capacity of each memtable in bytes (default: 1 GiB).
+	MemtableCap int64
+
+	// FlushInterval is the interval at which memtables are flushed to disk (default: 5s).
+	FlushInterval time.Duration
+}
+
+// DefaultOptions returns a set of sensible default options.
+func DefaultOptions() *Options {
+	return &Options{
+		CacheMB:       64,
+		MemtableCap:   1024 << 20,
+		FlushInterval: 5 * time.Second,
+	}
+}
 
 // Open opens or creates a FlexDB at the given path.
-// capMB is the per-table in-memory cache capacity in megabytes.
-func Open(path string, capMB uint64) (*DB, error) {
-	if err := os.MkdirAll(filepath.Join(path, "tables"), 0755); err != nil {
+func Open(ctx context.Context, path string, opts *Options) (*DB, error) {
+	if opts == nil {
+		opts = DefaultOptions()
+	}
+	if err := os.MkdirAll(filepath.Join(path, "tables"), 0700); err != nil {
 		return nil, fmt.Errorf("flexdb open: mkdir: %w", err)
 	}
 
 	db := &DB{
 		path:         path,
-		capMB:        capMB,
+		capMB:        opts.CacheMB,
+		memtableCap:  opts.MemtableCap,
+		flushInter:   opts.FlushInterval,
 		tablesByName: make(map[string]*Table),
 		tablesByID:   make(map[uint32]*Table),
 	}
@@ -78,7 +117,7 @@ func Open(path string, capMB uint64) (*DB, error) {
 	}
 
 	// Load existing tables from the registry and open their flexfiles.
-	if err := db.loadTablesRegistry(); err != nil {
+	if err := db.loadTablesRegistry(ctx); err != nil {
 		db.closeAll()
 		return nil, fmt.Errorf("flexdb open: load tables: %w", err)
 	}
@@ -102,7 +141,7 @@ func Open(path string, capMB uint64) (*DB, error) {
 	for _, mt := range db.memtables {
 		if mt.m.First().Valid() {
 			db.flushMT(mt)
-			mt.clear()
+			mt.reset()
 		}
 	}
 
@@ -128,7 +167,7 @@ func Open(path string, capMB uint64) (*DB, error) {
 
 // Table opens or creates a named table.
 // Multiple calls with the same name return the same handle.
-func (db *DB) Table(name string) (*Table, error) {
+func (db *DB) Table(ctx context.Context, name string) (*Table, error) {
 	db.tablesMu.Lock()
 	defer db.tablesMu.Unlock()
 
@@ -139,7 +178,7 @@ func (db *DB) Table(name string) (*Table, error) {
 	db.nextID++
 	id := db.nextID
 
-	t, err := db.openTable(id, name)
+	t, err := db.openTable(ctx, id, name)
 	if err != nil {
 		db.nextID--
 		return nil, err
@@ -157,10 +196,10 @@ func (db *DB) Table(name string) (*Table, error) {
 
 // DropTable removes a table and all its data (O(1) in data size).
 // After this call, any existing TableRef for the table must not be used.
-func (db *DB) DropTable(name string) error {
+func (db *DB) DropTable(ctx context.Context, name string) error {
 	// Flush to ensure no pending writes for this table are left in the memtable.
 	// Ignore sync errors here; DropTable is best-effort.
-	_ = db.Sync()
+	_ = db.Sync(ctx)
 
 	db.tablesMu.Lock()
 	defer db.tablesMu.Unlock()
@@ -207,7 +246,7 @@ func (db *DB) setFlushErr(err error) {
 
 // Close flushes all pending data and releases resources.
 func (db *DB) Close() error {
-	syncErr := db.Sync()
+	syncErr := db.Sync(context.Background())
 	if db.flushWorker != nil {
 		db.flushWorker.stop()
 	}
@@ -239,14 +278,19 @@ func (db *DB) closeAll() error {
 
 // Sync forces a full flush of all pending writes to the flexfiles.
 // Returns the first error encountered in the flush path, if any.
-func (db *DB) Sync() error {
+func (db *DB) Sync(ctx context.Context) error {
 	if db.flushWorker != nil {
 		db.flushWorker.triggerImmediate()
 	}
 	db.flushActiveMT()
-	db.flushActiveMT()
 	db.tablesMu.RLock()
 	for _, t := range db.tablesByID {
+		select {
+		case <-ctx.Done():
+			db.tablesMu.RUnlock()
+			return ctx.Err()
+		default:
+		}
 		if err := t.ff.Sync(); err != nil {
 			db.setFlushErr(err)
 		}
@@ -261,10 +305,14 @@ func (db *DB) Sync() error {
 
 // DBStats holds database-level statistics.
 type DBStats struct {
-	Seq             uint64 // sequence number of the last committed write
-	TableCount      int    // number of open tables (includes internal/index tables)
-	ActiveMTBytes   int64  // bytes in the active (writable) memtable
-	InactiveMTBytes int64  // bytes in the immutable (may be flushing) memtable
+	// Seq is the sequence number of the last committed write.
+	Seq uint64
+	// TableCount is the total number of open tables.
+	TableCount int
+	// ActiveMTBytes is the number of bytes currently in the active memtable.
+	ActiveMTBytes int64
+	// InactiveMTBytes is the number of bytes in the immutable (flushing) memtable.
+	InactiveMTBytes int64
 }
 
 // Stats returns a snapshot of database-level statistics.
@@ -278,6 +326,11 @@ func (db *DB) Stats() DBStats {
 		ActiveMTBytes:   db.activeMT().size.Load(),
 		InactiveMTBytes: db.immutableMT().size.Load(),
 	}
+}
+
+// Metrics returns a point-in-time copy of database performance metrics.
+func (db *DB) Metrics() MetricsSnapshot {
+	return db.metrics.Snapshot()
 }
 
 // Seq returns the sequence number of the last committed write.
@@ -320,19 +373,24 @@ func (db *DB) swapAndFlush() {
 		// WAL buffer not fully on disk; proceed anyway — data is in skip-list
 		// and will be written to flexfiles below.
 	}
+	db.metrics.WALFlushCount.Add(1)
 
 	if err := db.flushMT(immut); err != nil {
 		db.setFlushErr(err)
 		// Don't truncate WAL: data may not have reached flexfiles.
-		// Clear memtable anyway so the active MT can rotate in next cycle.
+		// BUT we MUST reset the memtable so the active MT can rotate,
+		// otherwise Put() will hang forever spinning on isFull().
 	} else {
+		db.metrics.FlushBatchCount.Add(1)
 		db.tablesMu.RLock()
+
 		for _, t := range db.tablesByID {
 			if err := t.ff.Sync(); err != nil {
 				db.setFlushErr(err)
 			}
 			t.blobs.sync()
 		}
+
 		db.tablesMu.RUnlock()
 
 		if err := immut.truncateLog(); err != nil {
@@ -344,7 +402,7 @@ func (db *DB) swapAndFlush() {
 		db.rwMT[i].Lock()
 	}
 	immut.hidden.Store(true)
-	immut.clear()
+	immut.reset()
 	immut.hidden.Store(false)
 	for i := range db.rwMT {
 		db.rwMT[i].Unlock()
@@ -464,8 +522,8 @@ func fileTagUnsorted(tag uint16) uint8 {
 
 // ---- table registry persistence ----
 
-// loadTablesRegistry reads the TABLES file and opens each table's flexfile.
-func (db *DB) loadTablesRegistry() error {
+// loadTablesRegistry reads the TABLE_REGISTRY file and opens each table's flexfile.
+func (db *DB) loadTablesRegistry(ctx context.Context) error {
 	path := filepath.Join(db.path, "TABLE_REGISTRY")
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
@@ -477,9 +535,36 @@ func (db *DB) loadTablesRegistry() error {
 	if len(data) < 4 {
 		return nil
 	}
-	n := int(binary.BigEndian.Uint32(data))
-	off := 4
+
+	var n int
+	off := 0
+
+	// Check for magic number to distinguish between legacy and v1+ formats.
+	magic := binary.BigEndian.Uint32(data[off:])
+	if magic == tableRegistryMagic {
+		off += 4
+		if len(data) < 12 {
+			return fmt.Errorf("table registry: truncated header")
+		}
+		version := binary.BigEndian.Uint32(data[off:])
+		off += 4
+		if version > tableRegistryVersion {
+			return fmt.Errorf("table registry: unsupported version %d", version)
+		}
+		n = int(binary.BigEndian.Uint32(data[off:]))
+		off += 4
+	} else {
+		// Legacy format: first 4 bytes is n_tables.
+		n = int(magic)
+		off += 4
+	}
+
 	for i := 0; i < n && off < len(data); i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		if off+2 > len(data) {
 			break
 		}
@@ -493,7 +578,7 @@ func (db *DB) loadTablesRegistry() error {
 		id := binary.BigEndian.Uint32(data[off:])
 		off += 4
 
-		t, err := db.openTable(id, name)
+		t, err := db.openTable(ctx, id, name)
 		if err != nil {
 			return fmt.Errorf("load table %q (id=%d): %w", name, id, err)
 		}
@@ -509,13 +594,17 @@ func (db *DB) loadTablesRegistry() error {
 // saveTablesRegistry writes the current table registry atomically to disk.
 func (db *DB) saveTablesRegistry() error {
 	// Compute required size.
-	size := 4 // n_tables (uint32)
+	size := 4 + 4 + 4 // magic (4) + version (4) + n_tables (4)
 	for name := range db.tablesByName {
 		size += 2 + len(name) + 4 // name_len + name + id
 	}
 
 	buf := make([]byte, size)
 	off := 0
+	binary.BigEndian.PutUint32(buf[off:], tableRegistryMagic)
+	off += 4
+	binary.BigEndian.PutUint32(buf[off:], tableRegistryVersion)
+	off += 4
 	binary.BigEndian.PutUint32(buf[off:], uint32(len(db.tablesByName)))
 	off += 4
 	for name, t := range db.tablesByName {
@@ -529,9 +618,10 @@ func (db *DB) saveTablesRegistry() error {
 
 	// Atomic write via rename.
 	tmp := filepath.Join(db.path, "TABLE_REGISTRY.tmp")
-	if err := os.WriteFile(tmp, buf[:off], 0644); err != nil {
+	if err := os.WriteFile(tmp, buf[:off], 0600); err != nil {
 		return err
 	}
+
 	return os.Rename(tmp, filepath.Join(db.path, "TABLE_REGISTRY"))
 }
 
@@ -541,4 +631,21 @@ type recoveryAnchor struct {
 	key      []byte
 	loff     uint64
 	unsorted uint8
+}
+
+// StartWorker starts the background flush worker.
+// Normally called automatically by Open(), but can be used to restart it if stopped.
+func (db *DB) StartWorker() {
+	db.flushMu.Lock()
+	defer db.flushMu.Unlock()
+	if db.flushWorker != nil {
+		return
+	}
+	fw := &flushWorker{
+		db:   db,
+		quit: make(chan struct{}),
+		done: make(chan struct{}),
+	}
+	db.flushWorker = fw
+	fw.start()
 }

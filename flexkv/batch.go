@@ -1,5 +1,9 @@
 package flexkv
 
+import (
+	"context"
+)
+
 // Batch is an index-aware multi-operation write batch.
 //
 // All operations — primary key writes and every secondary-index mutation they
@@ -76,7 +80,7 @@ func (b *Batch) Check(table *Table, key, expected []byte) {
 // Returns (true, nil) on success.
 // Returns (false, nil) if any user-supplied check fails; no writes are applied.
 // Returns (false, err) on a system error.
-func (b *Batch) Commit() (bool, error) {
+func (b *Batch) Commit(ctx context.Context) (bool, error) {
 	// Deduplicate: for each (table, key) pair keep only the last op.
 	ops := deduplicateBatchOps(b.ops)
 
@@ -88,7 +92,7 @@ func (b *Batch) Commit() (bool, error) {
 	}
 	states := make([]opState, len(ops))
 	for i, op := range ops {
-		old, err := op.table.dataFDB.NewRef().Get(op.key)
+		old, err := op.table.dataFDB.NewRef().Get(ctx, op.key)
 		if err != nil {
 			return false, err
 		}
@@ -139,7 +143,7 @@ func (b *Batch) Commit() (bool, error) {
 		}
 	}
 
-	return fb.Commit()
+	return fb.Commit(ctx)
 }
 
 // deduplicateBatchOps returns a slice containing only the last op for each

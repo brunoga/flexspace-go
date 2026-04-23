@@ -127,29 +127,34 @@ If you forget to call `RegisterIndex` on restart, the index data on disk will be
 ## Usage
 
 ```go
-import "github.com/brunoga/flexspace-go/flexkv"
+import (
+    "context"
+    "github.com/brunoga/flexspace-go/flexkv"
+)
+
+ctx := context.Background()
 
 // Open.
-db, err := flexkv.Open("/data/myapp", &flexkv.Options{CacheMB: 64})
+db, err := flexkv.Open(ctx, "/data/myapp", &flexkv.Options{CacheMB: 64})
 // ...
 defer db.Close()
 
 // Get or create a table.
-users, _ := db.Table("users")
+users, _ := db.Table(ctx, "users")
 
 // Register existing indexes on restart.
-users.RegisterIndex("by_dept", deptIndexer)
-users.RegisterIndex("by_role", roleIndexer)
+users.RegisterIndex(ctx, "by_dept", deptIndexer)
+users.RegisterIndex(ctx, "by_role", roleIndexer)
 
 // CRUD.
-if err := users.Put([]byte("alice"), []byte("engineering,senior")); err != nil {
+if err := users.Put(ctx, []byte("alice"), []byte("engineering,senior")); err != nil {
     log.Fatal(err)
 }
-if err := users.Put([]byte("bob"), []byte("design,mid")); err != nil {
+if err := users.Put(ctx, []byte("bob"), []byte("design,mid")); err != nil {
     log.Fatal(err)
 }
-val, _ := users.Get([]byte("alice"))
-if err := users.Delete([]byte("bob")); err != nil {
+val, _ := users.Get(ctx, []byte("alice"))
+if err := users.Delete(ctx, []byte("bob")); err != nil {
     log.Fatal(err)
 }
 
@@ -174,7 +179,7 @@ iit := idx.Get([]byte("engineering"))
 defer iit.Close()
 for ; iit.Valid(); iit.Next() {
     pk := iit.PrimaryKey()
-    val, _ := iit.GetRecord() // fetches full value by pk
+    val, _ := iit.GetRecord(ctx) // fetches full value by pk
     fmt.Printf("%s: %s\n", pk, val)
 }
 
@@ -183,10 +188,10 @@ iit2 := idx.Scan([]byte("design"), []byte("engineering"))
 defer iit2.Close()
 
 // Drop an index.
-users.DropIndex("by_dept")
+users.DropIndex(ctx, "by_dept")
 
 // Drop a table (and all its indexes).
-db.DropTable("users")
+db.DropTable(ctx, "users")
 
 // List user tables.
 names, _ := db.Tables() // ["users", "products", ...]
@@ -230,20 +235,20 @@ if ok {
 
 ```go
 // DB
-func Open(path string, opts *Options) (*DB, error)
-func (db *DB) Table(name string) (*Table, error)
-func (db *DB) DropTable(name string) error
+func Open(ctx context.Context, path string, opts *Options) (*DB, error)
+func (db *DB) Table(ctx context.Context, name string) (*Table, error)
+func (db *DB) DropTable(ctx context.Context, name string) error
 func (db *DB) Tables() ([]string, error)
 func (db *DB) Close() error
 func (db *DB) RawDB() *flexdb.DB
 
 // Table
-func (t *Table) Put(key, value []byte) error
-func (t *Table) Get(key []byte) ([]byte, error)
-func (t *Table) Delete(key []byte) error
-func (t *Table) CreateIndex(name string, indexer Indexer) error
-func (t *Table) RegisterIndex(name string, indexer Indexer) error
-func (t *Table) DropIndex(name string) error
+func (t *Table) Put(ctx context.Context, key, value []byte) error
+func (t *Table) Get(ctx context.Context, key []byte) ([]byte, error)
+func (t *Table) Delete(ctx context.Context, key []byte) error
+func (t *Table) CreateIndex(ctx context.Context, name string, indexer Indexer) error
+func (t *Table) RegisterIndex(ctx context.Context, name string, indexer Indexer) error
+func (t *Table) DropIndex(ctx context.Context, name string) error
 func (t *Table) Scan(start, end []byte) *Iterator
 func (t *Table) ScanPrefix(prefix []byte) *Iterator
 func (t *Table) Index(name string) *Index
@@ -266,6 +271,6 @@ func (it *IndexIterator) Valid() bool
 func (it *IndexIterator) Next()
 func (it *IndexIterator) Value() []byte       // indexed value
 func (it *IndexIterator) PrimaryKey() []byte
-func (it *IndexIterator) GetRecord() ([]byte, error)
+func (it *IndexIterator) GetRecord(ctx context.Context) ([]byte, error)
 func (it *IndexIterator) Close()
 ```

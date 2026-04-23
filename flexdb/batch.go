@@ -1,6 +1,11 @@
 package flexdb
 
-import "bytes"
+import (
+	"bytes"
+	"context"
+	"errors"
+	"time"
+)
 
 // Batch collects Put/Delete operations across one or more tables and commits
 // them atomically: written as a single WAL record, then applied to the shared
@@ -68,7 +73,7 @@ func (b *Batch) Check(table *Table, key, expected []byte) {
 // Returns (true, nil) if all conditions passed and the writes were applied.
 // Returns (false, nil) if any condition failed; no writes are applied.
 // Returns (false, err) on a system error.
-func (b *Batch) Commit() (bool, error) {
+func (b *Batch) Commit(ctx context.Context) (bool, error) {
 	if len(b.ops) == 0 && len(b.checks) == 0 {
 		return true, nil
 	}
@@ -77,10 +82,10 @@ func (b *Batch) Commit() (bool, error) {
 	// Validate all ops before touching shared state.
 	for _, op := range b.ops {
 		if len(op.key) == 0 || len(op.key) > MaxKVSize {
-			return false, errInvalidKV
+			return false, ErrInvalidKV
 		}
 		if len(op.value) > MaxBlobSize {
-			return false, errBlobTooLarge
+			return false, ErrBlobTooLarge
 		}
 	}
 
@@ -111,8 +116,17 @@ func (b *Batch) Commit() (bool, error) {
 		}
 	}
 
-	// Wait if the active memtable is full.
+	// Wait until the active memtable has capacity (same as Put).
+	maxWait := time.Now().Add(30 * time.Second)
 	for db.activeMT().isFull() {
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(time.Millisecond):
+		}
+		if time.Now().After(maxWait) {
+			return false, errors.New("flexdb: timeout waiting for memtable space (is flush worker running?)")
+		}
 	}
 
 	// Acquire ALL memtable write locks to ensure atomicity.

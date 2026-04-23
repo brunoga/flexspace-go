@@ -1,6 +1,9 @@
 package flextree
 
-import "slices"
+import (
+	"errors"
+	"slices"
+)
 
 // bruteForce is a simple reference implementation of the extent map used for
 // correctness validation of Tree. It is intentionally unoptimised.
@@ -245,4 +248,21 @@ func (bf *bruteForce) GetTag(loff uint64) (uint16, error) {
 		return curr.Tag, nil
 	}
 	return 0, ErrTagNotFound
+}
+
+// UpdatePoff updates the physical offset of an existing extent.
+func (bf *bruteForce) UpdatePoff(loff, poff uint64, length uint32) error {
+	if loff+uint64(length) > bf.maxLoff_ {
+		return ErrOutOfRange
+	}
+	target := bf.findPos(loff)
+	if target >= len(bf.extents) {
+		return errors.New("not found")
+	}
+	curr := &bf.extents[target]
+	if curr.Loff != loff || curr.Len != length {
+		return errors.New("mismatch")
+	}
+	curr.Poff = poff
+	return nil
 }

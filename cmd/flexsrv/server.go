@@ -81,14 +81,14 @@ func newServer(db *flexkv.DB, ss *SchemaStore, cfg *Config, initialTables map[st
 
 // table returns a cached *flexkv.Table handle, opening it on first use.
 // Using the same handle across requests preserves registered indexers.
-func (s *Server) table(name string) (*flexkv.Table, error) {
+func (s *Server) table(ctx context.Context, name string) (*flexkv.Table, error) {
 	s.tablesMu.RLock()
 	tbl, ok := s.tablesCache[name]
 	s.tablesMu.RUnlock()
 	if ok {
 		return tbl, nil
 	}
-	tbl, err := s.db.Table(name)
+	tbl, err := s.db.Table(ctx, name)
 	if err != nil {
 		return nil, err
 	}
@@ -174,7 +174,9 @@ func (s *Server) routes() http.Handler {
 
 	// read role
 	mux.HandleFunc(s.track("GET /v1/metrics", s.handleMetrics))
+	mux.HandleFunc(s.track("GET /metrics", s.handlePrometheusMetrics))
 	mux.HandleFunc(s.track("GET /v1/stats", s.handleStats))
+
 	mux.HandleFunc(s.track("GET /v1/tables", s.handleListTables))
 	mux.HandleFunc(s.track("GET /v1/tables/{table}/count", s.handleCount))
 	mux.HandleFunc(s.track("GET /v1/tables/{table}/stats", s.handleTableStats))
@@ -320,11 +322,12 @@ func (s *Server) handleCreateTable(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusBadRequest, "name is required")
 		return
 	}
-	if _, err := s.table(req.Name); err != nil { // opens and caches the handle
+	if _, err := s.table(r.Context(), req.Name); err != nil { // opens and caches the handle
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if err := s.ss.RecordTable(req.Name); err != nil {
+
 		slog.Warn("schema record table", "table", req.Name, "err", err)
 	}
 	writeJSON(w, http.StatusCreated, map[string]string{"name": req.Name})
@@ -336,10 +339,11 @@ func (s *Server) handleDropTable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	table := r.PathValue("table")
-	if err := s.db.DropTable(table); err != nil {
+	if err := s.db.DropTable(r.Context(), table); err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+
 	s.tablesMu.Lock()
 	delete(s.tablesCache, table)
 	s.tablesMu.Unlock()
@@ -354,7 +358,7 @@ func (s *Server) handleCount(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusForbidden, "read role required")
 		return
 	}
-	tbl, err := s.table(r.PathValue("table"))
+	tbl, err := s.table(r.Context(), r.PathValue("table"))
 	if err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -373,7 +377,7 @@ func (s *Server) handleIndexCount(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusForbidden, "read role required")
 		return
 	}
-	tbl, err := s.table(r.PathValue("table"))
+	tbl, err := s.table(r.Context(), r.PathValue("table"))
 	if err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -399,7 +403,7 @@ func (s *Server) handleTableStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tableName := r.PathValue("table")
-	tbl, err := s.table(tableName)
+	tbl, err := s.table(r.Context(), tableName)
 	if err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -415,7 +419,7 @@ func (s *Server) handleTableStats(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		// RegisterIndex is idempotent and opens the underlying flexdb table.
-		tbl.RegisterIndex(idx.Name, fn) //nolint:errcheck
+		tbl.RegisterIndex(r.Context(), idx.Name, fn) //nolint:errcheck
 		ft, ok := tbl.RawIndexTable(idx.Name)
 		if !ok {
 			continue
@@ -447,12 +451,12 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusForbidden, "read role required")
 		return
 	}
-	tbl, err := s.table(r.PathValue("table"))
+	tbl, err := s.table(r.Context(), r.PathValue("table"))
 	if err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	val, err := tbl.Get([]byte(r.PathValue("key")))
+	val, err := tbl.Get(r.Context(), []byte(r.PathValue("key")))
 	if err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -472,12 +476,12 @@ func (s *Server) handleExists(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusForbidden, "read role required")
 		return
 	}
-	tbl, err := s.table(r.PathValue("table"))
+	tbl, err := s.table(r.Context(), r.PathValue("table"))
 	if err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	val, err := tbl.Get([]byte(r.PathValue("key")))
+	val, err := tbl.Get(r.Context(), []byte(r.PathValue("key")))
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -506,12 +510,12 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("value exceeds max_value_bytes (%d)", s.cfg.Limits.MaxValueBytes))
 		return
 	}
-	tbl, err := s.table(r.PathValue("table"))
+	tbl, err := s.table(r.Context(), r.PathValue("table"))
 	if err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := tbl.Put([]byte(r.PathValue("key")), body); err != nil {
+	if err := tbl.Put(r.Context(), []byte(r.PathValue("key")), body); err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -523,12 +527,12 @@ func (s *Server) handleDeleteKey(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusForbidden, "write role required")
 		return
 	}
-	tbl, err := s.table(r.PathValue("table"))
+	tbl, err := s.table(r.Context(), r.PathValue("table"))
 	if err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := tbl.Delete([]byte(r.PathValue("key"))); err != nil {
+	if err := tbl.Delete(r.Context(), []byte(r.PathValue("key"))); err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -554,7 +558,7 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	tbl, err := s.table(r.PathValue("table"))
+	tbl, err := s.table(r.Context(), r.PathValue("table"))
 	if err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -640,14 +644,14 @@ func (s *Server) handleCreateIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tableName := r.PathValue("table")
-	tbl, err := s.table(tableName)
+	tbl, err := s.table(r.Context(), tableName)
 	if err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	// CreateIndex scans existing data to populate the index — can be slow for
 	// large tables, but it's correct and idempotent.
-	if err := tbl.CreateIndex(spec.Name, fn); err != nil {
+	if err := tbl.CreateIndex(r.Context(), spec.Name, fn); err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -664,12 +668,12 @@ func (s *Server) handleDropIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	tableName := r.PathValue("table")
 	indexName := r.PathValue("index")
-	tbl, err := s.table(tableName)
+	tbl, err := s.table(r.Context(), tableName)
 	if err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := tbl.DropIndex(indexName); err != nil {
+	if err := tbl.DropIndex(r.Context(), indexName); err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -704,7 +708,7 @@ func (s *Server) handleIndexScan(w http.ResponseWriter, r *http.Request) {
 
 	tableName := r.PathValue("table")
 	indexName := r.PathValue("index")
-	tbl, err := s.table(tableName)
+	tbl, err := s.table(r.Context(), tableName)
 	if err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -746,11 +750,12 @@ func (s *Server) handleIndexScan(w http.ResponseWriter, r *http.Request) {
 			PrimaryKey:   string(it.PrimaryKey()),
 		}
 		if fetchRecords {
-			rec, err := it.GetRecord()
+			rec, err := it.GetRecord(r.Context())
 			if err == nil {
 				row.Record = base64.StdEncoding.EncodeToString(rec)
 			}
 		}
+
 		if err := enc.Encode(row); err != nil {
 			break
 		}
@@ -820,7 +825,7 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 		if t, ok := tableCache[name]; ok {
 			return t, nil
 		}
-		t, err := s.table(name)
+		t, err := s.table(r.Context(), name)
 		if err != nil {
 			return nil, err
 		}
@@ -861,7 +866,7 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	committed, err := batch.Commit()
+	committed, err := batch.Commit(r.Context())
 	if err != nil {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -875,10 +880,11 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 			if terr != nil {
 				break
 			}
-			cur, gerr := tbl.Get([]byte(c.Key))
+			cur, gerr := tbl.Get(r.Context(), []byte(c.Key))
 			if gerr != nil {
 				break
 			}
+
 			var match bool
 			if c.Expected == nil {
 				match = cur == nil
@@ -939,7 +945,7 @@ func (s *Server) handleLoadSchema(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, tblSpec := range sc.Tables {
-		tbl, err := s.table(tblSpec.Name)
+		tbl, err := s.table(r.Context(), tblSpec.Name)
 		if err != nil {
 			apiError(w, http.StatusInternalServerError, "open table "+tblSpec.Name+": "+err.Error())
 			return
@@ -956,7 +962,7 @@ func (s *Server) handleLoadSchema(w http.ResponseWriter, r *http.Request) {
 				apiError(w, http.StatusBadRequest, fmt.Sprintf("index %s.%s: %v", tblSpec.Name, idxSpec.Name, err))
 				return
 			}
-			if err := tbl.CreateIndex(idxSpec.Name, fn); err != nil {
+			if err := tbl.CreateIndex(r.Context(), idxSpec.Name, fn); err != nil {
 				apiError(w, http.StatusInternalServerError, fmt.Sprintf("create index %s.%s: %v", tblSpec.Name, idxSpec.Name, err))
 				return
 			}
@@ -965,6 +971,7 @@ func (s *Server) handleLoadSchema(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -1006,13 +1013,14 @@ func (s *Server) handleDumpData(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, name := range names {
-		tbl, err := s.table(name)
+		tbl, err := s.table(r.Context(), name)
 		if err != nil {
 			slog.Warn("dump: open table", "table", name, "err", err)
 			continue
 		}
 		enc.Encode(header{Type: "table", Name: name}) //nolint:errcheck
 		it := tbl.Scan(nil, nil)
+
 		for ; it.Valid(); it.Next() {
 			enc.Encode(entry{ //nolint:errcheck
 				Type:  "entry",
@@ -1061,7 +1069,7 @@ func (s *Server) handleLoadData(w http.ResponseWriter, r *http.Request) {
 		}
 		switch l.Type {
 		case "table":
-			t, err := s.table(l.Name)
+			t, err := s.table(r.Context(), l.Name)
 			if err != nil {
 				errors = append(errors, "open table "+l.Name+": "+err.Error())
 				curTbl = nil
@@ -1079,12 +1087,13 @@ func (s *Server) handleLoadData(w http.ResponseWriter, r *http.Request) {
 				errors = append(errors, "decode value for key "+l.Key+": "+err.Error())
 				continue
 			}
-			if err := curTbl.Put([]byte(l.Key), val); err != nil {
+			if err := curTbl.Put(r.Context(), []byte(l.Key), val); err != nil {
 				errors = append(errors, "put "+l.Key+": "+err.Error())
 			} else {
 				imported++
 			}
 		}
+
 	}
 	if err := scanner.Err(); err != nil {
 		errors = append(errors, "read body: "+err.Error())
@@ -1095,4 +1104,72 @@ func (s *Server) handleLoadData(w http.ResponseWriter, r *http.Request) {
 		resp["errors"] = errors
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+func (s *Server) handlePrometheusMetrics(w http.ResponseWriter, r *http.Request) {
+	// No auth for Prometheus typically, or handled via infra.
+	// But let's require read role to be safe if a key is provided,
+	// or allow if it's a known monitoring IP in a real deployment.
+	// For v1, let's keep it simple: if auth is configured, use it.
+	if !hasRole(r, roleRead) {
+		apiError(w, http.StatusForbidden, "read role required")
+		return
+	}
+
+	m := s.db.RawDB().Metrics()
+	st := s.db.RawDB().Stats()
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	w.WriteHeader(http.StatusOK)
+
+	fmt.Fprintf(w, "# HELP flexdb_put_total Total number of Put operations\n")
+	fmt.Fprintf(w, "# TYPE flexdb_put_total counter\n")
+	fmt.Fprintf(w, "flexdb_put_total %d\n", m.PutCount)
+
+	fmt.Fprintf(w, "# HELP flexdb_get_total Total number of Get operations\n")
+	fmt.Fprintf(w, "# TYPE flexdb_get_total counter\n")
+	fmt.Fprintf(w, "flexdb_get_total %d\n", m.GetCount)
+
+	fmt.Fprintf(w, "# HELP flexdb_delete_total Total number of Delete operations\n")
+	fmt.Fprintf(w, "# TYPE flexdb_delete_total counter\n")
+	fmt.Fprintf(w, "flexdb_delete_total %d\n", m.DeleteCount)
+
+	fmt.Fprintf(w, "# HELP flexdb_cache_hits_total Total number of cache hits\n")
+	fmt.Fprintf(w, "# TYPE flexdb_cache_hits_total counter\n")
+	fmt.Fprintf(w, "flexdb_cache_hits_total %d\n", m.CacheHitCount)
+
+	fmt.Fprintf(w, "# HELP flexdb_cache_misses_total Total number of cache misses\n")
+	fmt.Fprintf(w, "# TYPE flexdb_cache_misses_total counter\n")
+	fmt.Fprintf(w, "flexdb_cache_misses_total %d\n", m.CacheMissCount)
+
+	fmt.Fprintf(w, "# HELP flexdb_wal_writes_total Total number of WAL records written\n")
+	fmt.Fprintf(w, "# TYPE flexdb_wal_writes_total counter\n")
+	fmt.Fprintf(w, "flexdb_wal_writes_total %d\n", m.WALWriteCount)
+
+	fmt.Fprintf(w, "# HELP flexdb_wal_flushes_total Total number of WAL flushes to disk\n")
+	fmt.Fprintf(w, "# TYPE flexdb_wal_flushes_total counter\n")
+	fmt.Fprintf(w, "flexdb_wal_flushes_total %d\n", m.WALFlushCount)
+
+	fmt.Fprintf(w, "# HELP flexdb_flush_batch_total Total number of memtable flush batches\n")
+	fmt.Fprintf(w, "# TYPE flexdb_flush_batch_total counter\n")
+	fmt.Fprintf(w, "flexdb_flush_batch_total %d\n", m.FlushBatchCount)
+
+	fmt.Fprintf(w, "# HELP flexdb_gc_reclaimed_bytes_total Total bytes reclaimed by GC\n")
+	fmt.Fprintf(w, "# TYPE flexdb_gc_reclaimed_bytes_total counter\n")
+	fmt.Fprintf(w, "flexdb_gc_reclaimed_bytes_total %d\n", m.GCReclaimedBytes)
+
+	fmt.Fprintf(w, "# HELP flexdb_gc_moved_bytes_total Total bytes moved by GC\n")
+	fmt.Fprintf(w, "# TYPE flexdb_gc_moved_bytes_total counter\n")
+	fmt.Fprintf(w, "flexdb_gc_moved_bytes_total %d\n", m.GCMovedBytes)
+
+	fmt.Fprintf(w, "# HELP flexdb_active_memtable_bytes Current size of active memtable\n")
+	fmt.Fprintf(w, "# TYPE flexdb_active_memtable_bytes gauge\n")
+	fmt.Fprintf(w, "flexdb_active_memtable_bytes %d\n", st.ActiveMTBytes)
+
+	fmt.Fprintf(w, "# HELP flexdb_inactive_memtable_bytes Current size of inactive memtable\n")
+	fmt.Fprintf(w, "# TYPE flexdb_inactive_memtable_bytes gauge\n")
+	fmt.Fprintf(w, "flexdb_inactive_memtable_bytes %d\n", st.InactiveMTBytes)
+
+	fmt.Fprintf(w, "# HELP flexdb_table_count Total number of open tables\n")
+	fmt.Fprintf(w, "# TYPE flexdb_table_count gauge\n")
+	fmt.Fprintf(w, "flexdb_table_count %d\n", st.TableCount)
 }

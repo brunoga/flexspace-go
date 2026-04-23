@@ -37,6 +37,9 @@ type Storage interface {
 
 	// Close releases all resources held by the store.
 	Close() error
+
+	// SetMetrics attaches a metrics collector to the store.
+	SetMetrics(m flexfile.Metrics)
 }
 
 // openStorage opens the default flexfile-backed Storage at path.

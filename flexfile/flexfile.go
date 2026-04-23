@@ -2,14 +2,17 @@
 // mapped data file, a write-ahead log (WAL), and a flextree extent map.
 // It provides Insert, Collapse, Update, Read, SetTag, and GC operations that
 // translate logical offsets to physical file positions, maintaining durability
-// through the WAL. Not safe for concurrent use; callers must synchronise.
+// through the WAL. Safe for concurrent use.
 package flexfile
 
 import (
+	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
@@ -49,7 +52,6 @@ const (
 	chunkSize = 1 << chunkBits
 )
 
-// op represents a flexfile WAL operation code.
 type op uint8
 
 const (
@@ -59,17 +61,23 @@ const (
 	opSetTag        op = 3
 )
 
-const logEntrySize = 16
+const (
+	logMagic     = 0x464C4F47 // 'FLOG'
+	logVersion   = 1
+	logEntrySize = 24
 
-// FlexFile is the Go implementation of the flexfile storage layer.
-// It provides a logical address space backed by a flat data file, a WAL log,
-// and a flextree extent map. All operations are not safe for concurrent use;
-// callers must synchronise externally.
+	pageSize     = 4096
+	checksumSize = 4 // CRC32 per page
+)
+
 type FlexFile struct {
-	path     string
-	tree     *flextree.Tree
-	dataFile *os.File
-	logFile  *os.File
+	path         string
+	tree         *flextree.Tree
+	dataFile     *os.File
+	logFile      *os.File
+	checksumFile *os.File
+
+	mu sync.Mutex
 
 	logBuf       []byte
 	logBufBase   unsafe.Pointer
@@ -80,17 +88,23 @@ type FlexFile struct {
 	lastChunkIdx uint64
 	lastChunk    []byte
 
-	bm *blockManager
+	bm      *blockManager
+	metrics Metrics
+}
+
+// SetMetrics attaches a metrics collector to the flexfile.
+func (ff *FlexFile) SetMetrics(m Metrics) {
+	ff.metrics = m
 }
 
 // Open opens or creates a flexfile at the given path.
 func Open(path string) (*FlexFile, error) {
-	if err := os.MkdirAll(path, 0755); err != nil {
+	if err := os.MkdirAll(path, 0700); err != nil {
 		return nil, fmt.Errorf("failed to create directory: %w", err)
 	}
 
 	dataFilePath := filepath.Join(path, "DATA")
-	dataFile, err := os.OpenFile(dataFilePath, os.O_RDWR|os.O_CREATE, 0644)
+	dataFile, err := os.OpenFile(dataFilePath, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open data file: %w", err)
 	}
@@ -110,10 +124,18 @@ func Open(path string) (*FlexFile, error) {
 	}
 
 	logFilePath := filepath.Join(path, "LOG")
-	logFile, err := os.OpenFile(logFilePath, os.O_RDWR|os.O_CREATE, 0644)
+	logFile, err := os.OpenFile(logFilePath, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
 		dataFile.Close()
 		return nil, fmt.Errorf("failed to open log file: %w", err)
+	}
+
+	checksumFilePath := filepath.Join(path, "CHECKSUMS")
+	checksumFile, err := os.OpenFile(checksumFilePath, os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		dataFile.Close()
+		logFile.Close()
+		return nil, fmt.Errorf("failed to open checksum file: %w", err)
 	}
 
 	logBuf := make([]byte, logMemCap)
@@ -122,82 +144,24 @@ func Open(path string) (*FlexFile, error) {
 		tree:         tree,
 		dataFile:     dataFile,
 		logFile:      logFile,
+		checksumFile: checksumFile,
 		logBuf:       logBuf,
 		logBufBase:   unsafe.Pointer(&logBuf[0]),
 		chunks:       make([][]byte, 16),
 		lastChunkIdx: ^uint64(0),
 	}
-
-	// Redo log
 	if err := ff.redoLog(); err != nil {
 		ff.Close()
-		return nil, fmt.Errorf("redo log failed: %w", err)
+		return nil, fmt.Errorf("failed to redo log: %w", err)
 	}
 
 	ff.bm = newBlockManager(ff)
 	if err := ff.bm.init(tree); err != nil {
 		ff.Close()
-		return nil, fmt.Errorf("init block manager: %w", err)
+		return nil, fmt.Errorf("failed to initialize block manager: %w", err)
 	}
 
 	return ff, nil
-}
-
-func (ff *FlexFile) ensureMapping(offset uint64) error {
-	chunkIdx := offset >> chunkBits
-	if chunkIdx == ff.lastChunkIdx {
-		return nil
-	}
-	if chunkIdx < uint64(len(ff.chunks)) && ff.chunks[chunkIdx] != nil {
-		ff.lastChunkIdx = chunkIdx
-		ff.lastChunk = ff.chunks[chunkIdx]
-		return nil
-	}
-
-	info, err := ff.dataFile.Stat()
-	if err != nil {
-		return err
-	}
-	currentSize := uint64(info.Size())
-	if offset >= currentSize {
-		return nil
-	}
-
-	requiredSize := int64((chunkIdx + 1) << chunkBits)
-	if info.Size() < requiredSize {
-		if err := ff.dataFile.Truncate(requiredSize); err != nil {
-			return err
-		}
-	}
-
-	ptr, err := syscall.Mmap(int(ff.dataFile.Fd()), int64(chunkIdx<<chunkBits), chunkSize, syscall.PROT_READ, syscall.MAP_SHARED)
-	if err != nil {
-		return err
-	}
-
-	// Hint to the kernel that we intend to access this chunk sequentially and
-	// that pages should be faulted in eagerly. Errors are advisory-only.
-	p := uintptr(unsafe.Pointer(&ptr[0]))
-	syscall.Syscall(syscall.SYS_MADVISE, p, uintptr(len(ptr)), syscall.MADV_SEQUENTIAL)
-	syscall.Syscall(syscall.SYS_MADVISE, p, uintptr(len(ptr)), syscall.MADV_WILLNEED)
-
-	if chunkIdx >= uint64(len(ff.chunks)) {
-		newCap := uint64(len(ff.chunks))
-		if newCap == 0 {
-			newCap = 16
-		}
-		for newCap <= chunkIdx {
-			newCap *= 2
-		}
-		newChunks := make([][]byte, newCap)
-		copy(newChunks, ff.chunks)
-		ff.chunks = newChunks
-	}
-
-	ff.chunks[chunkIdx] = ptr
-	ff.lastChunkIdx = chunkIdx
-	ff.lastChunk = ptr
-	return nil
 }
 
 func (ff *FlexFile) redoLog() error {
@@ -216,7 +180,27 @@ func (ff *FlexFile) redoLog() error {
 		return err
 	}
 
-	for off := int64(0); off+logEntrySize <= totalSize; off += logEntrySize {
+	off := int64(0)
+	entrySize := int64(logEntrySize)
+	versioned := false
+	if totalSize >= 16 {
+		magic := binary.BigEndian.Uint32(fullBuf[0:4])
+		if magic == logMagic {
+			version := binary.BigEndian.Uint32(fullBuf[4:8])
+			if version > logVersion {
+				return fmt.Errorf("flexfile: unsupported log version %d", version)
+			}
+			off = 16
+			versioned = true
+		}
+	}
+	if !versioned {
+		// Legacy WAL written before the magic header and CRC fields were added.
+		// Entries are 16 bytes (two uint64s) with no checksum.
+		entrySize = 16
+	}
+
+	for ; off+entrySize <= totalSize; off += entrySize {
 		p := (*uint64)(unsafe.Pointer(&fullBuf[off]))
 		v1 := *p
 		p = (*uint64)(unsafe.Pointer(&fullBuf[off+8]))
@@ -224,6 +208,21 @@ func (ff *FlexFile) redoLog() error {
 
 		if v1 == 0 && v2 == 0 {
 			continue
+		}
+
+		// Verify CRC for versioned entries.
+		if versioned {
+			storedCRC := binary.BigEndian.Uint32(fullBuf[off+16 : off+20])
+			c := crc32.NewIEEE()
+			var b [16]byte
+			binary.BigEndian.PutUint64(b[0:8], v1)
+			binary.BigEndian.PutUint64(b[8:16], v2)
+			c.Write(b[:])
+			if c.Sum32() != storedCRC {
+				// Corrupted entry: stop replaying here.
+				// For WAL, truncation of the last partial/corrupt entry is acceptable.
+				return ErrCorruptLog
+			}
 		}
 
 		o := op(v1 & 0x3)
@@ -243,7 +242,6 @@ func (ff *FlexFile) redoLog() error {
 		}
 	}
 
-	// Persist the recovered tree state before truncating the log.
 	// Without this, a second crash would lose the replayed operations.
 	treeMetaPath := filepath.Join(ff.path, "FLEXTREE_META")
 	treeNodePath := filepath.Join(ff.path, "FLEXTREE_NODE")
@@ -277,26 +275,39 @@ func (ff *FlexFile) Close() error {
 	}
 	dataErr := ff.dataFile.Close()
 	logErr := ff.logFile.Close()
+	checksumErr := ff.checksumFile.Close()
 	if syncErr != nil {
 		return syncErr
 	}
 	if dataErr != nil {
 		return dataErr
 	}
-	return logErr
+	if logErr != nil {
+		return logErr
+	}
+	return checksumErr
 }
 
 // Sync flushes pending data to disk.
 // Uses fdatasync to match C flexfile_sync_r. The tree is checkpointed to disk
 // once the WAL exceeds logMaxSize.
 func (ff *FlexFile) Sync() error {
+	ff.mu.Lock()
+	defer ff.mu.Unlock()
 	atomic.AddUint64(&syncCount, 1)
+
+	if ff.bm.currentBuf.off > 0 {
+		if err := ff.writeChecksums(ff.bm.currentBuf.blkID, ff.bm.currentBuf.data, ff.bm.currentBuf.off); err != nil {
+			return err
+		}
+	}
 	if err := ff.bm.flush(); err != nil {
 		return err
 	}
 	// Use fdatasync (syscall 187 on macOS) — faster than F_FULLFSYNC and
 	// sufficient for our durability guarantee (data already written via mmap).
 	syscall.Syscall(syscall.SYS_FDATASYNC, ff.dataFile.Fd(), 0, 0)
+	syscall.Syscall(syscall.SYS_FDATASYNC, ff.checksumFile.Fd(), 0, 0)
 	if err := ff.syncLog(); err != nil {
 		return err
 	}
@@ -312,6 +323,16 @@ func (ff *FlexFile) Sync() error {
 }
 
 func (ff *FlexFile) syncLog() error {
+	if ff.logTotalSize == 0 {
+		var h [16]byte
+		binary.BigEndian.PutUint32(h[0:4], logMagic)
+		binary.BigEndian.PutUint32(h[4:8], logVersion)
+		n, err := ff.logFile.WriteAt(h[:], 0)
+		if err != nil {
+			return fmt.Errorf("flexfile: log header write failed: %w", err)
+		}
+		ff.logTotalSize += uint64(n)
+	}
 	if ff.logBufSize == 0 {
 		return nil
 	}
@@ -345,11 +366,27 @@ func (ff *FlexFile) logWrite(o op, p1, p2 uint64, p3 uint32) {
 	p = (*uint64)(unsafe.Add(ff.logBufBase, off+8))
 	*p = v2
 
+	// Compute CRC32
+	c := crc32.NewIEEE()
+	var b [16]byte
+	binary.BigEndian.PutUint64(b[0:8], v1)
+	binary.BigEndian.PutUint64(b[8:16], v2)
+	c.Write(b[:])
+	storedCRC := c.Sum32()
+
+	p32 := (*uint32)(unsafe.Add(ff.logBufBase, off+16))
+	*p32 = storedCRC
+
 	ff.logBufSize += logEntrySize
+	if ff.metrics.WALWriteCount != nil {
+		ff.metrics.WALWriteCount.Add(1)
+	}
 }
 
 // Read reads data from the flexfile at the given logical offset.
 func (ff *FlexFile) Read(buf []byte, loff uint64) (int, error) {
+	ff.mu.Lock()
+	defer ff.mu.Unlock()
 	if loff+uint64(len(buf)) > ff.tree.MaxLoff() {
 		return 0, io.EOF
 	}
@@ -382,6 +419,11 @@ func (ff *FlexFile) Read(buf []byte, loff uint64) (int, error) {
 			if chunk != nil {
 				copy(targetBuf, chunk[chunkOff:chunkOff+res.Len])
 				n = int(res.Len)
+
+				// Verify checksum for the mapped data.
+				if err := ff.verifyChecksum(res.Poff, targetBuf); err != nil {
+					return bytesRead, err
+				}
 			}
 
 			if n == 0 {
@@ -390,7 +432,14 @@ func (ff *FlexFile) Read(buf []byte, loff uint64) (int, error) {
 				if err != nil && err != io.EOF {
 					return bytesRead, err
 				}
+				// Verify checksum for the data read from disk.
+				if n > 0 {
+					if err := ff.verifyChecksum(res.Poff, targetBuf[:n]); err != nil {
+						return bytesRead, err
+					}
+				}
 			}
+
 		}
 		bytesRead += n
 	}
@@ -400,67 +449,14 @@ func (ff *FlexFile) Read(buf []byte, loff uint64) (int, error) {
 
 // Insert inserts data at the given logical offset, shifting subsequent data.
 func (ff *FlexFile) Insert(buf []byte, loff uint64) (int, error) {
-	if loff > ff.tree.MaxLoff() {
-		return 0, fmt.Errorf("holes not allowed")
-	}
-
-	// Hot path for single-extent insertions at the end.
-	maxLoff := ff.tree.MaxLoff()
-	if loff == maxLoff && len(buf) <= maxExtentSize {
-		bm := ff.bm
-		cb := bm.currentBuf
-		// If the data won't fit in the remaining space of the current block,
-		// advance to a fresh block so this write is always a single extent.
-		if int(blockSize-cb.off) < len(buf) {
-			if err := bm.nextBlock(); err != nil {
-				return 0, err
-			}
-			cb = bm.currentBuf
-		}
-		poff := cb.blkID*blockSize + cb.off
-		n := len(buf)
-		copy(cb.data[cb.off:], buf)
-		if bm.usage[cb.blkID] == 0 {
-			bm.freeBlocks--
-		}
-		bm.usage[cb.blkID] += uint32(n)
-		cb.off += uint64(n)
-		if cb.off == blockSize {
-			if err := bm.nextBlock(); err != nil {
-				return 0, err
-			}
-		}
-
-		err := ff.tree.InsertAppend(poff, uint32(n))
-		if err != nil {
-			return 0, err
-		}
-
-		// Fast log write with pre-calculated values.
-		v1 := uint64(opTreeInsert) | (loff << 2) | (poff << 50)
-		v2 := (poff >> 14) | (uint64(n) << 34)
-
-		off := uintptr(ff.logBufSize)
-		p := (*uint64)(unsafe.Add(ff.logBufBase, off))
-		*p = v1
-		p = (*uint64)(unsafe.Add(ff.logBufBase, off+8))
-		*p = v2
-		ff.logBufSize += logEntrySize
-
-		if ff.logBufSize >= logMemCap {
-			if err := ff.flushLogIfFull(); err != nil {
-				return n, err
-			}
-		}
-		return n, nil
-	}
-
+	ff.mu.Lock()
+	defer ff.mu.Unlock()
 	return ff.insertR(buf, loff, true)
 }
 
 func (ff *FlexFile) insertR(buf []byte, loff uint64, commit bool) (int, error) {
 	if loff > ff.tree.MaxLoff() {
-		return 0, fmt.Errorf("holes not allowed")
+		return 0, ErrNoHoles
 	}
 
 	bytesInserted := 0
@@ -496,12 +492,14 @@ func (ff *FlexFile) insertR(buf []byte, loff uint64, commit bool) (int, error) {
 
 // Collapse removes a logical range and compacts following extents.
 func (ff *FlexFile) Collapse(loff, length uint64) error {
+	ff.mu.Lock()
+	defer ff.mu.Unlock()
 	return ff.collapseR(loff, length, true)
 }
 
 func (ff *FlexFile) collapseR(loff, length uint64, commit bool) error {
 	if loff+length > ff.tree.MaxLoff() {
-		return fmt.Errorf("out of range")
+		return ErrOutOfRange
 	}
 
 	var qbuf [16]flextree.QueryResult
@@ -530,31 +528,57 @@ func (ff *FlexFile) collapseR(loff, length uint64, commit bool) error {
 // Write writes data at the given logical offset, replacing existing data.
 // If loff is at the end of file, Write behaves like Insert.
 func (ff *FlexFile) Write(buf []byte, loff uint64) (int, error) {
+	ff.mu.Lock()
+	defer ff.mu.Unlock()
 	size := ff.tree.MaxLoff()
+
 	if loff > size {
-		return 0, fmt.Errorf("holes not allowed")
+		return 0, ErrNoHoles
 	} else if loff == size {
-		return ff.Insert(buf, loff)
+		return ff.insertR(buf, loff, true)
 	}
 
 	if loff+uint64(len(buf)) > size {
-		err := ff.Collapse(loff, size-loff)
+		err := ff.collapseR(loff, size-loff, true)
 		if err != nil {
 			return 0, err
 		}
-		return ff.Insert(buf, loff)
+		return ff.insertR(buf, loff, true)
 	}
 
-	return ff.Update(buf, loff, uint64(len(buf)))
+	tag, _ := ff.getTagR(loff)
+
+	err := ff.collapseR(loff, uint64(len(buf)), false)
+	if err != nil {
+		return 0, err
+	}
+
+	n, err := ff.insertR(buf, loff, false)
+	if err != nil {
+		return 0, err
+	}
+
+	if tag != 0 {
+		ff.setTagR(loff, tag, false)
+	}
+
+	if ff.logBufSize >= logMemCap {
+		if err := ff.flushLogIfFull(); err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }
 
 // Update replaces olen bytes at loff with the contents of buf.
 func (ff *FlexFile) Update(buf []byte, loff, olen uint64) (int, error) {
+	ff.mu.Lock()
+	defer ff.mu.Unlock()
 	if loff+olen > ff.tree.MaxLoff() {
-		return 0, fmt.Errorf("out of range")
+		return 0, ErrOutOfRange
 	}
 
-	tag, _ := ff.GetTag(loff)
+	tag, _ := ff.getTagR(loff)
 
 	err := ff.collapseR(loff, olen, false)
 	if err != nil {
@@ -581,6 +605,8 @@ func (ff *FlexFile) Update(buf []byte, loff, olen uint64) (int, error) {
 
 // SetTag sets a tag at the given logical offset.
 func (ff *FlexFile) SetTag(loff uint64, tag uint16) error {
+	ff.mu.Lock()
+	defer ff.mu.Unlock()
 	return ff.setTagR(loff, tag, true)
 }
 
@@ -603,22 +629,36 @@ func (ff *FlexFile) setTagR(loff uint64, tag uint16, commit bool) error {
 
 // GetTag retrieves the tag at the given logical offset.
 func (ff *FlexFile) GetTag(loff uint64) (uint16, error) {
+	ff.mu.Lock()
+	defer ff.mu.Unlock()
+	return ff.getTagR(loff)
+}
+
+func (ff *FlexFile) getTagR(loff uint64) (uint16, error) {
 	return ff.tree.GetTag(loff)
 }
 
-// Size returns the current logical size of the flexfile in bytes.
 func (ff *FlexFile) Size() uint64 {
+	ff.mu.Lock()
+	defer ff.mu.Unlock()
+	return ff.sizeR()
+}
+
+func (ff *FlexFile) sizeR() uint64 {
 	return ff.tree.MaxLoff()
 }
 
 // Fallocate ensures space is allocated for size bytes starting at loff.
 func (ff *FlexFile) Fallocate(loff, size uint64) error {
+	ff.mu.Lock()
+	defer ff.mu.Unlock()
 	remain := size
+
 	off := uint64(0)
 	buf := make([]byte, maxExtentSize)
 	for remain > 0 {
 		tsize := min(remain, uint64(maxExtentSize))
-		_, err := ff.Insert(buf[:tsize], loff+off)
+		_, err := ff.insertR(buf[:tsize], loff+off, true)
 		if err != nil {
 			return err
 		}
@@ -630,15 +670,20 @@ func (ff *FlexFile) Fallocate(loff, size uint64) error {
 
 // Ftruncate resizes the flexfile to size bytes, collapsing the tail if needed.
 func (ff *FlexFile) Ftruncate(size uint64) error {
-	fsize := ff.Size()
+	ff.mu.Lock()
+	defer ff.mu.Unlock()
+	fsize := ff.tree.MaxLoff()
+
 	if fsize <= size {
 		return nil
 	}
-	return ff.Collapse(size, fsize-size)
+	return ff.collapseR(size, fsize-size, true)
 }
 
 // GC reclaims physical space by rewriting extents on sparsely-used blocks.
 func (ff *FlexFile) GC() {
+	ff.mu.Lock()
+	defer ff.mu.Unlock()
 	if ff.bm.freeBlocks >= gcThreshold {
 		return
 	}
@@ -648,7 +693,10 @@ func (ff *FlexFile) GC() {
 		blkID := poff >> blockBits
 		if ff.bm.usage[blkID] < threshold {
 			buf := make([]byte, length)
-			n, err := ff.Read(buf, loff)
+			// Internal read from within the same locked FlexFile.
+			// We can't call ff.Read because it would deadlock.
+			// We need a readR or similar.
+			n, err := ff.readR(buf, loff)
 			if err != nil || uint32(n) != length {
 				return true
 			}
@@ -663,16 +711,87 @@ func (ff *FlexFile) GC() {
 			ff.bm.updateUsage(blkID, -int32(length))
 
 			ff.logWrite(opGC, loff, newPoff, length)
+
+			if ff.metrics.GCReclaimedBytes != nil {
+				ff.metrics.GCReclaimedBytes.Add(uint64(length))
+			}
+			if ff.metrics.GCMovedBytes != nil {
+				ff.metrics.GCMovedBytes.Add(uint64(length))
+			}
 		}
+
 		return true
 	})
+}
+
+func (ff *FlexFile) readR(buf []byte, loff uint64) (int, error) {
+	if loff+uint64(len(buf)) > ff.tree.MaxLoff() {
+		return 0, io.EOF
+	}
+
+	var qbuf [16]flextree.QueryResult
+	results := ff.tree.Query(loff, uint64(len(buf)), qbuf[:])
+	bytesRead := 0
+	for _, res := range results {
+		slen := int(res.Len)
+		targetBuf := buf[bytesRead : bytesRead+slen]
+
+		n := ff.bm.read(targetBuf, res.Poff)
+		if n == 0 {
+			chunkIdx := res.Poff >> chunkBits
+			chunkOff := res.Poff & (chunkSize - 1)
+
+			var chunk []byte
+			if chunkIdx == ff.lastChunkIdx {
+				chunk = ff.lastChunk
+			} else if chunkIdx < uint64(len(ff.chunks)) {
+				chunk = ff.chunks[chunkIdx]
+			}
+
+			if chunk == nil {
+				if err := ff.ensureMapping(res.Poff); err == nil {
+					chunk = ff.lastChunk
+				}
+			}
+
+			if chunk != nil {
+				copy(targetBuf, chunk[chunkOff:chunkOff+res.Len])
+				n = int(res.Len)
+
+				// Verify checksum for the mapped data.
+				if err := ff.verifyChecksum(res.Poff, targetBuf); err != nil {
+					return bytesRead, err
+				}
+			}
+
+			if n == 0 {
+				var err error
+				n, err = ff.dataFile.ReadAt(targetBuf, int64(res.Poff))
+				if err != nil && err != io.EOF {
+					return bytesRead, err
+				}
+				// Verify checksum for the data read from disk.
+				if n > 0 {
+					if err := ff.verifyChecksum(res.Poff, targetBuf[:n]); err != nil {
+						return bytesRead, err
+					}
+				}
+			}
+		}
+		bytesRead += n
+	}
+
+	return bytesRead, nil
 }
 
 // IterateExtents calls fn for each extent in the logical range [start, end).
 // fn receives the logical offset, the file tag, and the raw data bytes for
 // that extent. Iteration stops early if fn returns false.
 func (ff *FlexFile) IterateExtents(start, end uint64, fn func(loff uint64, tag uint16, data []byte) bool) {
+	ff.mu.Lock()
+	defer ff.mu.Unlock()
 	buf := make([]byte, maxExtentSize)
+
 	ff.tree.IterateExtents(func(loff, poff uint64, length uint32, tag uint16) bool {
 		if loff >= end {
 			return false
@@ -745,6 +864,10 @@ func (bm *blockManager) init(tree *flextree.Tree) error {
 	}
 	bm.currentBuf.blkID = blkID
 	bm.currentBuf.off = 0
+	// Zero out the buffer for the new block to ensure clean checksums for partial pages.
+	for i := range bm.currentBuf.data {
+		bm.currentBuf.data[i] = 0
+	}
 	return nil
 }
 
@@ -841,6 +964,10 @@ func (bm *blockManager) nextBlock() error {
 		if err != nil {
 			return fmt.Errorf("flexfile: block write failed: %w", err)
 		}
+
+		if err := bm.ff.writeChecksums(bm.currentBuf.blkID, bm.currentBuf.data, bm.currentBuf.off); err != nil {
+			return err
+		}
 	}
 	blkID, err := bm.findEmptyBlock()
 	if err != nil {
@@ -848,6 +975,10 @@ func (bm *blockManager) nextBlock() error {
 	}
 	bm.currentBuf.blkID = blkID
 	bm.currentBuf.off = 0
+	// Zero out the buffer for the new block to ensure clean checksums for partial pages.
+	for i := range bm.currentBuf.data {
+		bm.currentBuf.data[i] = 0
+	}
 	return nil
 }
 
@@ -883,4 +1014,161 @@ func (bm *blockManager) read(buf []byte, poff uint64) int {
 
 	copy(buf, bm.currentBuf.data[blkOff:blkOff+uint64(n)])
 	return n
+}
+
+func (ff *FlexFile) verifyChecksum(poff uint64, data []byte) error {
+	numPagesInBlock := uint64(blockSize / pageSize)
+	offInBlock := poff % blockSize
+	blkID := poff / blockSize
+
+	// Skip verification for the active write block.
+	if blkID == ff.bm.currentBuf.blkID {
+		return nil
+	}
+
+	currentOff := uint64(0)
+
+	for currentOff < uint64(len(data)) {
+		pageIdx := (offInBlock + currentOff) / pageSize
+		pageStart := pageIdx * pageSize
+
+		storedCRCBuf := make([]byte, 4)
+		checkOff := int64(blkID*numPagesInBlock*uint64(checksumSize) + pageIdx*uint64(checksumSize))
+		if _, err := ff.checksumFile.ReadAt(storedCRCBuf, checkOff); err != nil {
+			if err == io.EOF {
+				return nil // No checksum yet
+			}
+			return err
+		}
+
+		storedCRC := binary.BigEndian.Uint32(storedCRCBuf)
+		if storedCRC != 0 {
+			// Get the full page for verification.
+			fullPage := make([]byte, pageSize)
+			chunkIdx := (blkID*blockSize + pageStart) >> chunkBits
+			chunkOff := (blkID*blockSize + pageStart) & (chunkSize - 1)
+
+			if chunkIdx < uint64(len(ff.chunks)) && ff.chunks[chunkIdx] != nil {
+				chunk := ff.chunks[chunkIdx]
+				copy(fullPage, chunk[chunkOff:])
+			} else {
+				// Fallback to ReadAt
+				if _, err := ff.dataFile.ReadAt(fullPage, int64(blkID*blockSize+pageStart)); err != nil {
+					if err == io.EOF {
+						goto next // Sparse file / hole
+					}
+					return err
+				}
+			}
+
+			if crc := crc32.ChecksumIEEE(fullPage); crc != storedCRC {
+				if crc == 0 && storedCRC == 0xFFFFFFFF {
+					// okay
+				} else {
+					// Check if page is all zeros (common for unwritten pages)
+					allZero := true
+					for _, b := range fullPage {
+						if b != 0 {
+							allZero = false
+							break
+						}
+					}
+					if allZero {
+						goto next
+					}
+					return fmt.Errorf("%w: at poff %d, got %08x want %08x", ErrCorruptData, blkID*blockSize+pageStart, crc, storedCRC)
+				}
+			}
+
+		}
+
+	next:
+		// Advance to next page boundary.
+
+		bytesReadInThisPage := (offInBlock + currentOff) % pageSize
+		bytesLeftInPage := pageSize - bytesReadInThisPage
+		currentOff += min(bytesLeftInPage, uint64(len(data))-currentOff)
+	}
+	return nil
+}
+
+func (ff *FlexFile) writeChecksums(blkID uint64, data []byte, length uint64) error {
+	numPagesInBlock := uint64(blockSize / pageSize)
+	// We only write checksums for FULL pages.
+	// Partial pages at the very end of the file will be checksummed once they are full.
+	numPages := length / pageSize
+	var b [4]byte
+	for i := uint64(0); i < numPages; i++ {
+		pageStart := i * pageSize
+		pageEnd := (i + 1) * pageSize
+		pageData := data[pageStart:pageEnd]
+		c := crc32.ChecksumIEEE(pageData)
+		if c == 0 {
+			c = 0xFFFFFFFF // Sentinel for natural zero CRC
+		}
+		binary.BigEndian.PutUint32(b[:], c)
+
+		checkOff := int64(blkID*numPagesInBlock*uint64(checksumSize) + i*uint64(checksumSize))
+		if _, err := ff.checksumFile.WriteAt(b[:], checkOff); err != nil {
+			return fmt.Errorf("flexfile: checksum write failed: %w", err)
+		}
+	}
+	return nil
+}
+
+func (ff *FlexFile) ensureMapping(offset uint64) error {
+	chunkIdx := offset >> chunkBits
+	if chunkIdx == ff.lastChunkIdx {
+		return nil
+	}
+	if chunkIdx < uint64(len(ff.chunks)) && ff.chunks[chunkIdx] != nil {
+		ff.lastChunkIdx = chunkIdx
+		ff.lastChunk = ff.chunks[chunkIdx]
+		return nil
+	}
+
+	info, err := ff.dataFile.Stat()
+	if err != nil {
+		return err
+	}
+	currentSize := uint64(info.Size())
+	if offset >= currentSize {
+		return nil
+	}
+
+	requiredSize := int64((chunkIdx + 1) << chunkBits)
+	if info.Size() < requiredSize {
+		if err := ff.dataFile.Truncate(requiredSize); err != nil {
+			return err
+		}
+	}
+
+	ptr, err := syscall.Mmap(int(ff.dataFile.Fd()), int64(chunkIdx<<chunkBits), chunkSize, syscall.PROT_READ, syscall.MAP_SHARED)
+	if err != nil {
+		return err
+	}
+
+	// Hint to the kernel that we intend to access this chunk sequentially and
+	// that pages should be faulted in eagerly. Errors are advisory-only.
+	p := uintptr(unsafe.Pointer(&ptr[0]))
+	syscall.Syscall(syscall.SYS_MADVISE, p, uintptr(len(ptr)), syscall.MADV_SEQUENTIAL)
+	syscall.Syscall(syscall.SYS_MADVISE, p, uintptr(len(ptr)), syscall.MADV_WILLNEED)
+
+	if chunkIdx >= uint64(len(ff.chunks)) {
+		newCap := uint64(len(ff.chunks))
+		if newCap == 0 {
+			newCap = 16
+		}
+		for newCap <= chunkIdx {
+			newCap *= 2
+		}
+		newChunks := make([][]byte, newCap)
+		copy(newChunks, ff.chunks)
+		ff.chunks = newChunks
+	}
+
+	ff.chunks[chunkIdx] = ptr
+	ff.lastChunkIdx = chunkIdx
+	ff.lastChunk = ptr
+	return nil
 }

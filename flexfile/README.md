@@ -24,9 +24,12 @@ Because the mapping is maintained in the extent tree, an `Insert` at logical off
 |----------|-------|-------------|
 | `blockSize` | 4 MiB | Unit of physical allocation |
 | `chunkSize` | 64 MiB | Unit of mmap window |
+| `pageSize` | 4 KiB | Unit of checksumming |
 | `maxExtentSize` | 128 KiB | Maximum length of one logical extent |
 | `logMemCap` | 64 MiB | In-memory WAL buffer before flush |
 | `logMaxSize` | 2 GiB | On-disk WAL size before tree checkpoint |
+| `logEntrySize` | 24 B | Versioned WAL record size (with CRC) |
+| `checksumSize` | 4 B | CRC32 per page |
 
 The data file is accessed via `mmap` in 64 MiB chunks. Chunks are mapped on demand and unmapped on `Close`. This keeps the virtual address space footprint proportional to the actually accessed working set rather than the full file size.
 
@@ -146,5 +149,6 @@ type Storage interface {
     Size() uint64
     Sync() error
     Close() error
+    SetMetrics(m Metrics)
 }
 ```

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -45,8 +46,9 @@ func loadAndRegisterSchema(db *flexkv.DB, dbPath string) (*SchemaStore, map[stri
 	// because the index data is already on disk; we just need to reattach the
 	// in-memory function so that future writes keep the index current.
 	tables := make(map[string]*flexkv.Table)
+	bg := context.Background()
 	for _, tbl := range ss.schema.Tables {
-		t, err := db.Table(tbl.Name)
+		t, err := db.Table(bg, tbl.Name)
 		if err != nil {
 			return nil, nil, fmt.Errorf("open table %q: %w", tbl.Name, err)
 		}
@@ -56,7 +58,7 @@ func loadAndRegisterSchema(db *flexkv.DB, dbPath string) (*SchemaStore, map[stri
 			if err != nil {
 				return nil, nil, fmt.Errorf("index %s.%s: %w", tbl.Name, idx.Name, err)
 			}
-			if err := t.RegisterIndex(idx.Name, fn); err != nil {
+			if err := t.RegisterIndex(bg, idx.Name, fn); err != nil {
 				return nil, nil, fmt.Errorf("register index %s.%s: %w", tbl.Name, idx.Name, err)
 			}
 		}
