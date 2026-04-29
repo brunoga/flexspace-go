@@ -2,7 +2,6 @@ package flexdb
 
 import (
 	"bytes"
-	"sync"
 	"sync/atomic"
 )
 
@@ -23,7 +22,7 @@ const skipInlineLevel = 4
 //	next  [skipInlineLevel]atomic.Pointer[skipNode]
 //	tower []atomic.Pointer[skipNode]
 //
-// All pointer fields are atomic so readers can traverse without holding mu.
+// All pointer fields are atomic so readers and writers can proceed concurrently.
 type skipNode struct {
 	key   []byte
 	value atomic.Pointer[[]byte]
@@ -32,15 +31,15 @@ type skipNode struct {
 }
 
 type skipList struct {
-	head  skipNode   // sentinel; tower pre-allocated at maxSkipLevel
-	mu    sync.Mutex // serializes all writes; readers are lock-free
+	head  skipNode    // sentinel; tower pre-allocated at maxSkipLevel
 	level atomic.Int32
-	rng   uint64 // xorshift64 PRNG — only accessed under mu
+	rng   atomic.Uint64 // xorshift64 PRNG
 }
 
 func newSkipList() *skipList {
-	sl := &skipList{rng: 42}
+	sl := &skipList{}
 	sl.level.Store(1)
+	sl.rng.Store(42)
 	if maxSkipLevel > skipInlineLevel {
 		sl.head.tower = make([]atomic.Pointer[skipNode], maxSkipLevel-skipInlineLevel)
 	}
@@ -48,18 +47,24 @@ func newSkipList() *skipList {
 }
 
 // randomLevel returns a level in [1, maxSkipLevel] with p = 0.25.
-// Must be called with mu held.
+// Uses a CAS-based PRNG so concurrent callers each get a distinct state.
 func (sl *skipList) randomLevel() int {
-	sl.rng ^= sl.rng << 13
-	sl.rng ^= sl.rng >> 7
-	sl.rng ^= sl.rng << 17
-	r := sl.rng
-	lvl := 1
-	for lvl < maxSkipLevel && r&3 == 0 {
-		r >>= 2
-		lvl++
+	for {
+		old := sl.rng.Load()
+		nxt := old
+		nxt ^= nxt << 13
+		nxt ^= nxt >> 7
+		nxt ^= nxt << 17
+		if sl.rng.CompareAndSwap(old, nxt) {
+			r := nxt
+			lvl := 1
+			for lvl < maxSkipLevel && r&3 == 0 {
+				r >>= 2
+				lvl++
+			}
+			return lvl
+		}
 	}
-	return lvl
 }
 
 // nodeNext returns the level-i next pointer of n using an atomic load.
@@ -74,7 +79,7 @@ func nodeNext(n *skipNode, i int) *skipNode {
 	return nil
 }
 
-// nodeStore sets the level-i next pointer of n using an atomic store.
+// nodeStore atomically stores v as the level-i next pointer of n.
 func nodeStore(n *skipNode, i int, v *skipNode) {
 	if i < skipInlineLevel {
 		n.next[i].Store(v)
@@ -83,22 +88,25 @@ func nodeStore(n *skipNode, i int, v *skipNode) {
 	}
 }
 
-// Set inserts or updates key with value.
-// Writers are serialized by mu; concurrent Gets and Seeks are lock-free.
-//
-// Insertion publishes the new node at level 0 first so that readers always
-// observe a fully-linked level-0 chain. Higher-level links follow immediately
-// (still under mu, so no other writer can interfere), and each level's forward
-// pointer is stored into the new node before the node is spliced into the
-// predecessor, guaranteeing that a reader that sees the new node at level i
-// also sees a valid forward pointer at level i.
-func (sl *skipList) Set(key, value []byte) {
-	sl.mu.Lock()
-	defer sl.mu.Unlock()
+// nodeCAS atomically replaces n's level-i next pointer using CAS.
+// A node at level i is always in the level-i list and therefore has tower
+// capacity for level i, so the tower bounds check is a safety fallback only.
+func nodeCAS(n *skipNode, i int, old, nw *skipNode) bool {
+	if i < skipInlineLevel {
+		return n.next[i].CompareAndSwap(old, nw)
+	}
+	j := i - skipInlineLevel
+	if j < len(n.tower) {
+		return n.tower[j].CompareAndSwap(old, nw)
+	}
+	return false
+}
 
-	var preds [maxSkipLevel]*skipNode
-	var succs [maxSkipLevel]*skipNode
-
+// find locates the predecessor and successor of key at every level.
+// Returns the node at level 0 if key is already present, else nil.
+// preds[i] is set to the rightmost node at level i with key < target;
+// succs[i] is preds[i]'s level-i successor (first node with key >= target).
+func (sl *skipList) find(key []byte, preds *[maxSkipLevel]*skipNode, succs *[maxSkipLevel]*skipNode) *skipNode {
 	cur := &sl.head
 	level := int(sl.level.Load())
 	for i := level - 1; i >= 0; i-- {
@@ -112,43 +120,78 @@ func (sl *skipList) Set(key, value []byte) {
 			cur = nxt
 		}
 	}
-
-	// Update value in place if key already exists.
 	if succs[0] != nil && bytes.Equal(succs[0].key, key) {
-		v := &value
-		succs[0].value.Store(v)
-		return
+		return succs[0]
 	}
+	return nil
+}
 
-	lvl := sl.randomLevel()
-	if lvl > level {
-		for i := level; i < lvl; i++ {
+// Set inserts or updates key with value.
+//
+// Concurrency model — fully lock-free:
+//   - Multiple writers can call Set concurrently without a mutex.
+//   - A new node is published by CAS-ing the level-0 link first so Get() always
+//     finds it at level 0 even before higher-level links are established.
+//   - At each level i: n.next[i] is stored before the predecessor's CAS so any
+//     reader that observes n at level i also sees a valid n.next[i].
+//   - preds[] is pre-filled with &sl.head so levels above the current list height
+//     (which find() does not traverse) have a valid, fully-towered CAS target.
+func (sl *skipList) Set(key, value []byte) {
+	for {
+		var preds [maxSkipLevel]*skipNode
+		for i := range preds {
 			preds[i] = &sl.head
-			succs[i] = nil
 		}
-		sl.level.Store(int32(lvl))
-	}
+		var succs [maxSkipLevel]*skipNode
+		found := sl.find(key, &preds, &succs)
 
-	n := &skipNode{key: key}
-	v := &value
-	n.value.Store(v)
-	if lvl > skipInlineLevel {
-		n.tower = make([]atomic.Pointer[skipNode], lvl-skipInlineLevel)
-	}
+		if found != nil {
+			v := &value
+			found.value.Store(v)
+			return
+		}
 
-	// Publish at level 0 first, then link higher levels in order.
-	// At each level: initialize n's forward pointer before splicing n in,
-	// so readers that observe n at level i always see a valid n.next[i].
-	nodeStore(n, 0, succs[0])
-	nodeStore(preds[0], 0, n)
-	for i := 1; i < lvl; i++ {
-		nodeStore(n, i, succs[i])
-		nodeStore(preds[i], i, n)
+		lvl := sl.randomLevel()
+		// Extend the list height if needed.
+		for {
+			oldLvl := sl.level.Load()
+			if int32(lvl) <= oldLvl || sl.level.CompareAndSwap(oldLvl, int32(lvl)) {
+				break
+			}
+		}
+
+		n := &skipNode{key: key}
+		v := &value
+		n.value.Store(v)
+		if lvl > skipInlineLevel {
+			n.tower = make([]atomic.Pointer[skipNode], lvl-skipInlineLevel)
+		}
+
+		// Publish at level 0 first. If the CAS fails, someone else modified
+		// preds[0] between find() and now — restart the whole operation.
+		nodeStore(n, 0, succs[0])
+		if !nodeCAS(preds[0], 0, succs[0], n) {
+			continue
+		}
+
+		// Level 0 succeeded: n is now visible to Get() and iterators.
+		// Link higher levels one at a time. A CAS failure here only means
+		// another insert raced at that level; refind and retry that level.
+		for i := 1; i < lvl; i++ {
+			for {
+				nodeStore(n, i, succs[i])
+				if nodeCAS(preds[i], i, succs[i], n) {
+					break
+				}
+				sl.find(key, &preds, &succs)
+			}
+		}
+		return
 	}
 }
 
 // Get returns (value, true) if key is present, else (nil, false).
-// Lock-free: safe to call concurrently with Set and other Gets.
+// Fully lock-free: safe to call concurrently with Set and other Gets.
 func (sl *skipList) Get(key []byte) ([]byte, bool) {
 	cur := &sl.head
 	level := int(sl.level.Load())
@@ -192,22 +235,6 @@ func (sl *skipList) Seek(key []byte) *skipIter {
 // First returns an iterator at the first (smallest) key.
 func (sl *skipList) First() *skipIter {
 	return &skipIter{cur: nodeNext(&sl.head, 0)}
-}
-
-// Clear removes all entries by severing the head's pointers.
-// Callers must ensure no readers are active (memtable.reset() spins on readers
-// reaching zero before calling this).
-func (sl *skipList) Clear() {
-	sl.mu.Lock()
-	defer sl.mu.Unlock()
-	for i := range sl.head.next {
-		sl.head.next[i].Store(nil)
-	}
-	for i := range sl.head.tower {
-		sl.head.tower[i].Store(nil)
-	}
-	sl.level.Store(1)
-	sl.rng = 42
 }
 
 // skipIter is a forward iterator over a skipList.

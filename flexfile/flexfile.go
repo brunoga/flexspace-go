@@ -772,6 +772,10 @@ func (bm *blockManager) write(buf []byte) (int, error) {
 
 	if bm.currentBuf.off == blockSize {
 		if err := bm.flush(); err != nil {
+			// Flush failed: roll back so the buffer is in a consistent state
+			// for the next call. The bytes were never durably written.
+			bm.currentBuf.off -= uint64(n)
+			bm.usage[bm.currentBuf.blkID] -= uint32(n)
 			return 0, err
 		}
 		bm.pickNewBlock()
