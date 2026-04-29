@@ -30,10 +30,10 @@ func (ref *TableRef) Put(ctx context.Context, key, value []byte) error {
 	}
 
 	storeValue := value
-	if len(key)+len(value) > MaxKVSize && len(value) > 0 {
-		// Large value: write to the blob store first (with fdatasync), then
-		// store a sentinel in the memtable. The fdatasync ensures that if the
-		// sentinel reaches durable storage the blob bytes are already on disk.
+	if len(value) > 0 && (len(key)+len(value) > MaxKVSize || isBlobSentinel(value)) {
+		// Route through the blob store when the value is too large to fit
+		// inline OR when it matches the sentinel pattern exactly — the latter
+		// prevents false-positive sentinel detection on reads.
 		offset, err := t.blobs.write(value)
 		if err != nil {
 			return err
@@ -283,7 +283,7 @@ func (ref *TableRef) Update(ctx context.Context, key, oldValue, newValue []byte)
 
 	// Determine what to store for newValue.
 	storeValue := newValue
-	if len(key)+len(newValue) > MaxKVSize && len(newValue) > 0 {
+	if len(newValue) > 0 && (len(key)+len(newValue) > MaxKVSize || isBlobSentinel(newValue)) {
 		offset, err := t.blobs.write(newValue)
 		if err != nil {
 			return false, err

@@ -238,6 +238,9 @@ func (t *Table) RegisterIndex(ctx context.Context, name string, indexer Indexer)
 	defer t.mu.Unlock()
 	t.indexers[name] = indexer
 	_, err := t.indexFDBTable(ctx, name)
+	if err != nil {
+		delete(t.indexers, name)
+	}
 	return err
 }
 
@@ -247,6 +250,9 @@ func (t *Table) CreateIndex(ctx context.Context, name string, indexer Indexer) e
 	t.mu.Lock()
 	t.indexers[name] = indexer
 	ft, err := t.indexFDBTable(ctx, name)
+	if err != nil {
+		delete(t.indexers, name)
+	}
 	t.mu.Unlock()
 	if err != nil {
 		return err
@@ -271,6 +277,9 @@ func (t *Table) CreateIndex(ctx context.Context, name string, indexer Indexer) e
 				return err
 			}
 		}
+	}
+	if err := it.Err(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -363,6 +372,7 @@ func (it *Iterator) Next()         { it.it.Next() }
 func (it *Iterator) Close()        { it.it.Close() }
 func (it *Iterator) Key() []byte   { return it.it.Current().Key }
 func (it *Iterator) Value() []byte { return it.it.Current().Value }
+func (it *Iterator) Err() error    { return it.it.Err() }
 
 // ---- Index ----
 
@@ -373,16 +383,16 @@ type Index struct {
 }
 
 // fdbTable returns the flexdb table for this index (opens it if needed).
-func (idx *Index) fdbTable() (*flexdb.Table, error) {
+func (idx *Index) fdbTable(ctx context.Context) (*flexdb.Table, error) {
 	idx.t.mu.Lock()
 	defer idx.t.mu.Unlock()
-	return idx.t.indexFDBTable(context.Background(), idx.name)
+	return idx.t.indexFDBTable(ctx, idx.name)
 }
 
 // Scan returns an iterator over index entries whose indexed value is in [start, end).
 // A nil start seeks to the first entry; a nil end has no upper bound.
-func (idx *Index) Scan(start, end []byte) *IndexIterator {
-	ft, err := idx.fdbTable()
+func (idx *Index) Scan(ctx context.Context, start, end []byte) *IndexIterator {
+	ft, err := idx.fdbTable(ctx)
 	if err != nil {
 		return &IndexIterator{err: err}
 	}
@@ -404,8 +414,8 @@ func (idx *Index) Scan(start, end []byte) *IndexIterator {
 
 // ScanPrefix returns an iterator over all index entries whose indexed value
 // starts with prefix.
-func (idx *Index) ScanPrefix(prefix []byte) *IndexIterator {
-	ft, err := idx.fdbTable()
+func (idx *Index) ScanPrefix(ctx context.Context, prefix []byte) *IndexIterator {
+	ft, err := idx.fdbTable(ctx)
 	if err != nil {
 		return &IndexIterator{err: err}
 	}
@@ -438,7 +448,7 @@ func (idx *Index) ScanPrefix(prefix []byte) *IndexIterator {
 }
 
 // Get returns an iterator over all records with exactly this indexed value.
-func (idx *Index) Get(value []byte) *IndexIterator {
+func (idx *Index) Get(ctx context.Context, value []byte) *IndexIterator {
 	end := make([]byte, len(value))
 	copy(end, value)
 	// Increment last byte to get exclusive upper bound for this exact value.
@@ -453,7 +463,7 @@ func (idx *Index) Get(value []byte) *IndexIterator {
 			end = nil
 		}
 	}
-	return idx.Scan(value, end)
+	return idx.Scan(ctx, value, end)
 }
 
 // ---- IndexIterator ----
@@ -487,6 +497,18 @@ func (it *IndexIterator) Close() {
 	if it.it != nil {
 		it.it.Close()
 	}
+}
+
+// Err returns the first error encountered during iteration, if any.
+// Always check Err after a loop that exits because Valid() returned false.
+func (it *IndexIterator) Err() error {
+	if it.err != nil {
+		return it.err
+	}
+	if it.it != nil {
+		return it.it.Err()
+	}
+	return nil
 }
 
 // Value returns the indexed value for the current entry.

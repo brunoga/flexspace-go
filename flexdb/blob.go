@@ -115,13 +115,11 @@ func (bs *blobStore) close() error {
 	return closeErr
 }
 
-// isBlobSentinel reports whether val is a blob reference sentinel.
-// Inline values and tombstones are never sentinels: inline values satisfy
-// len(key)+len(value) ≤ MaxKVSize (so len(value) < MaxKVSize), which makes
-// the blobSentinelSize (16 bytes) overlap possible only when
-// len(key) ≥ MaxKVSize−15. In practice, applications that store 16-byte
-// values whose first four bytes are 0xB10BB10B with a very long key would
-// hit a false positive; this is documented as a known limitation.
+// isBlobSentinel reports whether val matches the blob reference sentinel
+// pattern: exactly blobSentinelSize bytes whose first four bytes equal
+// blobMagic. The Put/Update/Batch paths force any user value that matches
+// this pattern through the blob store (even if it would otherwise fit
+// inline), so no false positives can arise during reads.
 func isBlobSentinel(val []byte) bool {
 	return len(val) == blobSentinelSize &&
 		binary.LittleEndian.Uint32(val) == blobMagic

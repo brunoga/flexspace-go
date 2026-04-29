@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"os"
 	"strings"
@@ -29,7 +30,7 @@ func collectIndexScan(t *testing.T, c *ctx, table, index string) [][2]string {
 	t.Helper()
 	tbl := c.table(table)
 	idx := tbl.Index(index)
-	it := idx.Scan(nil, nil)
+	it := idx.Scan(context.Background(), nil, nil)
 	defer it.Close()
 	var rows [][2]string
 	for ; it.Valid(); it.Next() {

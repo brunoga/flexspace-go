@@ -2,6 +2,7 @@ package flexdb
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -331,9 +332,16 @@ func (mt *memtable) isFull() bool {
 }
 
 // reset replaces the memtable map and size counter (called after flush completes).
-// Spins until all readers have finished using the old map.
+// Spins until all readers have finished using the old map. Panics after 30 s
+// because a stuck reader (e.g. hung blob I/O) would permanently block the
+// flush worker and deadlock all writers.
 func (mt *memtable) reset() {
+	const timeout = 30 * time.Second
+	deadline := time.Now().Add(timeout)
 	for mt.readers.Load() > 0 {
+		if time.Now().After(deadline) {
+			panic(fmt.Sprintf("flexdb: memtable.reset: %d reader(s) still active after %s — possible deadlock or stuck blob I/O", mt.readers.Load(), timeout))
+		}
 		time.Sleep(1 * time.Microsecond)
 	}
 	mt.m = newSkipList()

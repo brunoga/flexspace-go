@@ -294,8 +294,14 @@ func (db *DB) closeAll() error {
 }
 
 // Sync forces a full flush of all pending writes to the flexfiles.
-// Returns the first error encountered in the flush path, if any.
+// Returns the first error encountered during this Sync call, if any.
+// Each call resets the error state so transient failures are not reported
+// indefinitely; the returned error always reflects the current flush.
 func (db *DB) Sync(ctx context.Context) error {
+	db.flushErrMu.Lock()
+	db.flushErr = nil
+	db.flushErrMu.Unlock()
+
 	db.flushActiveMT()
 	// If the immutable memtable still has pending data from a previously
 	// failed flush (e.g., after storage error recovery), retry it now so

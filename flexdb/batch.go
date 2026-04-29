@@ -96,7 +96,7 @@ func (b *Batch) Commit(ctx context.Context) (bool, error) {
 	// sentinel reaches the WAL the blob bytes are already on disk.
 	for i := range b.ops {
 		op := &b.ops[i]
-		if len(op.key)+len(op.value) > MaxKVSize && len(op.value) > 0 {
+		if len(op.value) > 0 && (len(op.key)+len(op.value) > MaxKVSize || isBlobSentinel(op.value)) {
 			offset, err := op.table.blobs.write(op.value)
 			if err != nil {
 				return false, err

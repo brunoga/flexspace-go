@@ -118,7 +118,7 @@ func TestIndexScan(t *testing.T) {
 
 	// Index scan [B, C) should return Bob (user1) and Bert (user4).
 	idx := tbl.Index("first_letter")
-	it := idx.Scan([]byte("B"), []byte("C"))
+	it := idx.Scan(context.Background(), []byte("B"), []byte("C"))
 	defer it.Close()
 
 	wantPKs := map[string]string{
@@ -157,7 +157,7 @@ func TestIndexScanVariableLengthValues(t *testing.T) {
 	mustPut(t, tbl, "k3", "Mm")
 
 	idx := tbl.Index("name")
-	it := idx.Scan([]byte("A"), []byte("Z"))
+	it := idx.Scan(context.Background(), []byte("A"), []byte("Z"))
 	defer it.Close()
 
 	var got []string
@@ -183,14 +183,14 @@ func TestIndexUpdate(t *testing.T) {
 	idx := tbl.Index("first_letter")
 
 	// A should be empty now.
-	itA := idx.Scan([]byte("A"), []byte("B"))
+	itA := idx.Scan(context.Background(), []byte("A"), []byte("B"))
 	defer itA.Close()
 	if itA.Valid() {
 		t.Error("stale index entry under A after update")
 	}
 
 	// B should have exactly one entry.
-	itB := idx.Scan([]byte("B"), []byte("C"))
+	itB := idx.Scan(context.Background(), []byte("B"), []byte("C"))
 	defer itB.Close()
 	count := 0
 	for ; itB.Valid(); itB.Next() {
