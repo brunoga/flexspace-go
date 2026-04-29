@@ -35,6 +35,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -229,17 +230,18 @@ func makeIndexer(idx SchemaIndex) (flexkv.Indexer, error) {
 		if delim == "" {
 			delim = ","
 		}
+		delimBytes := []byte(delim)
 		n := idx.Field
 		return func(_, value []byte) [][]byte {
-			parts := strings.Split(string(value), delim)
+			parts := bytes.SplitN(value, delimBytes, n+2)
 			if n >= len(parts) {
 				return nil
 			}
-			f := strings.TrimSpace(parts[n])
-			if f == "" {
+			f := bytes.TrimSpace(parts[n])
+			if len(f) == 0 {
 				return nil
 			}
-			return [][]byte{[]byte(f)}
+			return [][]byte{f}
 		}, nil
 	default:
 		return nil, fmt.Errorf("unknown indexer type %q (want: prefix, suffix, exact, field)", idx.Type)

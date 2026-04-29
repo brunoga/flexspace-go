@@ -39,7 +39,9 @@ func openFresh(b *testing.B, capMB uint64) (*DB, *TableRef, string) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	db, err := Open(context.Background(), dir, &Options{CacheMB: capMB})
+	opts := DefaultOptions()
+	opts.CacheMB = capMB
+	db, err := Open(context.Background(), dir, opts)
 	if err != nil {
 		os.RemoveAll(dir)
 		b.Fatal(err)

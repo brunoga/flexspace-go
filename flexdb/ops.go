@@ -7,6 +7,12 @@ import (
 	"time"
 )
 
+// mtFullTicker returns a new ticker for the memtable-full busy-wait loop and
+// the deadline for the 30-second timeout. Call Stop on the ticker when done.
+func newMTWaitTicker() (*time.Ticker, time.Time) {
+	return time.NewTicker(time.Millisecond), time.Now().Add(30 * time.Second)
+}
+
 // Put inserts or updates a key-value pair in the table. Values larger than
 // MaxKVSize−len(key) bytes are stored in the per-table blob file; a 16-byte
 // sentinel is written to the main KV store in their place.
@@ -40,16 +46,20 @@ func (ref *TableRef) Put(ctx context.Context, key, value []byte) error {
 	pkey := makePrefixedKey(t.id, key)
 	h := hash32(pkey)
 
-	maxWait := time.Now().Add(30 * time.Second)
-	for db.activeMT().isFull() {
-		// Brief yield; background worker swaps when ready.
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(time.Millisecond):
-		}
-		if time.Now().After(maxWait) {
-			return errors.New("flexdb: timeout waiting for memtable space (is flush worker running?)")
+	if db.activeMT().isFull() {
+		// Brief yield; background worker swaps when ready. Use a single ticker
+		// to avoid allocating a new timer on every iteration.
+		ticker, deadline := newMTWaitTicker()
+		defer ticker.Stop()
+		for db.activeMT().isFull() {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-ticker.C:
+			}
+			if time.Now().After(deadline) {
+				return errors.New("flexdb: timeout waiting for memtable space (is flush worker running?)")
+			}
 		}
 	}
 
@@ -84,35 +94,38 @@ func (ref *TableRef) Get(ctx context.Context, key []byte) ([]byte, error) {
 func (ref *TableRef) GetView(ctx context.Context, key []byte) ([]byte, error) {
 	t := ref.table
 	db := t.db
-	pkey := makePrefixedKey(t.id, key)
+
+	// Use a pooled buffer for the prefixed key — Get never stores it in the skip list.
+	pkey := borrowPKey(t.id, key)
 	h := hash32(pkey)
 
 	// 1. Check active memtable.
 	lockID := db.enterMT(h)
 	active := db.activeMT()
+	var mtVal []byte
+	var mtFound bool
 	if !active.hidden.Load() {
-		val, ok := active.get(pkey)
+		mtVal, mtFound = active.get(pkey)
 		db.exitMT(lockID)
-		if ok {
-			if len(val) == 0 {
-				return nil, nil // tombstone
-			}
-			return t.expandBlob(val)
-		}
 	} else {
 		db.exitMT(lockID)
 	}
 
-	// 2. Check immutable memtable.
-	immut := db.immutableMT()
-	if !immut.hidden.Load() {
-		val, ok := immut.get(pkey)
-		if ok {
-			if len(val) == 0 {
-				return nil, nil
-			}
-			return t.expandBlob(val)
+	// 2. Check immutable memtable (still need pkey).
+	if !mtFound {
+		immut := db.immutableMT()
+		if !immut.hidden.Load() {
+			mtVal, mtFound = immut.get(pkey)
 		}
+	}
+
+	returnPKey(pkey) // done with pooled buffer
+
+	if mtFound {
+		if len(mtVal) == 0 {
+			return nil, nil // tombstone
+		}
+		return t.expandBlob(mtVal)
 	}
 
 	// 3. Check flexfile (table's own tree/cache).
@@ -130,27 +143,32 @@ func (ref *TableRef) GetView(ctx context.Context, key []byte) ([]byte, error) {
 func (ref *TableRef) Probe(ctx context.Context, key []byte) (bool, error) {
 	t := ref.table
 	db := t.db
-	pkey := makePrefixedKey(t.id, key)
+
+	// Use a pooled buffer for the prefixed key — Probe never stores it.
+	pkey := borrowPKey(t.id, key)
 	h := hash32(pkey)
 
 	lockID := db.enterMT(h)
 	active := db.activeMT()
+	var mtProbe int
 	if !active.hidden.Load() {
-		p := active.probe(pkey)
+		mtProbe = active.probe(pkey)
 		db.exitMT(lockID)
-		if p != 0 {
-			return p == 2, nil
-		}
 	} else {
 		db.exitMT(lockID)
 	}
 
-	immut := db.immutableMT()
-	if !immut.hidden.Load() {
-		p := immut.probe(pkey)
-		if p != 0 {
-			return p == 2, nil
+	if mtProbe == 0 {
+		immut := db.immutableMT()
+		if !immut.hidden.Load() {
+			mtProbe = immut.probe(pkey)
 		}
+	}
+
+	returnPKey(pkey) // done with pooled buffer
+
+	if mtProbe != 0 {
+		return mtProbe == 1, nil
 	}
 
 	h2 := hash32(key)
@@ -204,15 +222,18 @@ func (ref *TableRef) Update(ctx context.Context, key, oldValue, newValue []byte)
 	lockID := h & (lockShards - 1)
 
 	// Wait until the active memtable has capacity (same as Put).
-	maxWait := time.Now().Add(30 * time.Second)
-	for db.activeMT().isFull() {
-		select {
-		case <-ctx.Done():
-			return false, ctx.Err()
-		case <-time.After(time.Millisecond):
-		}
-		if time.Now().After(maxWait) {
-			return false, errors.New("flexdb: timeout waiting for memtable space (is flush worker running?)")
+	if db.activeMT().isFull() {
+		ticker, deadline := newMTWaitTicker()
+		defer ticker.Stop()
+		for db.activeMT().isFull() {
+			select {
+			case <-ctx.Done():
+				return false, ctx.Err()
+			case <-ticker.C:
+			}
+			if time.Now().After(deadline) {
+				return false, errors.New("flexdb: timeout waiting for memtable space (is flush worker running?)")
+			}
 		}
 	}
 

@@ -76,7 +76,7 @@ func FuzzFlexFile(f *testing.F) {
 				val := bytes.Repeat([]byte{data[off+5]}, length)
 				off += 6
 
-				n, err := ff.Write(val, pos)
+				n, err := ff.Update(val, pos, uint64(length))
 				if err != nil {
 					t.Fatalf("Write: %v", err)
 				}

@@ -95,13 +95,20 @@ func (bs *blobStore) read(offset uint64, size uint32) ([]byte, error) {
 	return buf, nil
 }
 
-func (bs *blobStore) sync() {
-	syscall.Syscall(syscall.SYS_FDATASYNC, bs.f.Fd(), 0, 0)
+func (bs *blobStore) sync() error {
+	if _, _, errno := syscall.Syscall(syscall.SYS_FDATASYNC, bs.f.Fd(), 0, 0); errno != 0 {
+		return fmt.Errorf("blob fdatasync: %w", errno)
+	}
+	return nil
 }
 
 func (bs *blobStore) close() error {
-	bs.sync()
-	return bs.f.Close()
+	syncErr := bs.sync()
+	closeErr := bs.f.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
 }
 
 // isBlobSentinel reports whether val is a blob reference sentinel.

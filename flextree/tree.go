@@ -33,6 +33,8 @@ var (
 	ErrExtentTooLarge = errors.New("extent size too large")
 	// ErrOutOfRange indicates a requested logical offset range is outside current tree bounds.
 	ErrOutOfRange = errors.New("offset out of range")
+	// ErrCorruptedTree indicates the tree structure is corrupted (e.g. a cycle was detected).
+	ErrCorruptedTree = errors.New("corrupted tree structure detected")
 	// ErrTagNotFound indicates no tag exists at the requested logical offset.
 	ErrTagNotFound = errors.New("tag not found")
 )
@@ -282,6 +284,9 @@ func (t *Tree) insertR(loff, poff uint64, length uint32, tag uint16) error {
 
 	var p path
 	t.findLeafNode(loff, &p)
+	if p.level == 255 {
+		return ErrCorruptedTree
+	}
 	node := p.nodes[p.level]
 
 	node.insertToLeaf(uint32(p.oloff), poff, length, tag)
@@ -320,6 +325,9 @@ func (t *Tree) Delete(loff, length uint64) error {
 	for olen > 0 {
 		var p path
 		t.findLeafNode(loff, &p)
+		if p.level == 255 {
+			return ErrCorruptedTree
+		}
 		tloff := p.oloff
 		node := p.nodes[p.level]
 
@@ -337,6 +345,10 @@ func (t *Tree) Delete(loff, length uint64) error {
 		currExtent := &ld.extents[target]
 
 		tlen := min(uint64(currExtent.loff+currExtent.len)-tloff, olen)
+		if tlen == 0 {
+			// loff is exactly at the end of this extent; nothing to delete here.
+			break
+		}
 
 		shift := uint32(1)
 		if uint64(currExtent.loff) == tloff {
@@ -414,6 +426,9 @@ func (t *Tree) Query(loff, length uint64, buf []QueryResult) []QueryResult {
 
 	// Optimized leaf-only traversal
 	node, relLoff := t.findLeaf(loff)
+	if node == nil {
+		return nil
+	}
 	ld := node.leaf()
 	idx := findPosInLeaf(node, uint32(relLoff))
 
@@ -480,7 +495,11 @@ func (t *Tree) findLeaf(loff uint64) (*node, uint64) {
 
 	node := t.root
 	l := loff
+	depth := 0
 	for !node.isLeaf {
+		if depth >= pathDepth {
+			return nil, 0 // corruption: cycle detected
+		}
 		in := node.internal()
 		count := node.count
 		// BCE hints
@@ -492,6 +511,7 @@ func (t *Tree) findLeaf(loff uint64) (*node, uint64) {
 
 		l -= uint64(ce.shift)
 		node = ce.node
+		depth++
 	}
 
 	t.lastLeaf = node
@@ -537,6 +557,10 @@ func (t *Tree) findLeafNode(loff uint64, p *path) {
 	}
 
 	for {
+		if p.level >= pathDepth {
+			p.level = 255 // sentinel: corrupted tree, cycle detected
+			return
+		}
 		in := node.internal()
 		count := node.count
 
@@ -583,6 +607,9 @@ func (t *Tree) SetTag(oloff uint64, tag uint16) error {
 	if uint64(currExtent.loff) == relLoff {
 		currExtent.setTag(tag)
 	} else {
+		if node.count >= leafCap {
+			return fmt.Errorf("flextree: SetTag failed: leaf node full, cannot split extent")
+		}
 		so := uint32(relLoff - uint64(currExtent.loff))
 		copy(ld.extents[target+2:node.count+1], ld.extents[target+1:node.count])
 
@@ -615,6 +642,9 @@ func (t *Tree) UpdatePoff(oloff, poff uint64, length uint32) error {
 	}
 
 	node, relLoff := t.findLeaf(oloff)
+	if node == nil {
+		return ErrCorruptedTree
+	}
 	target := findPosInLeaf(node, uint32(relLoff))
 	if target >= node.count {
 		return ErrOutOfRange
@@ -641,6 +671,9 @@ func (t *Tree) GetTag(oloff uint64) (uint16, error) {
 	}
 
 	node, relLoff := t.findLeaf(oloff)
+	if node == nil {
+		return 0, ErrCorruptedTree
+	}
 	target := findPosInLeaf(node, uint32(relLoff))
 	if target >= node.count {
 		return 0, ErrOutOfRange
@@ -742,17 +775,20 @@ func (t *Tree) Sync(metaPath, nodePath string) error {
 		return err
 	}
 
-	// Write metadata only after all new node data is on disk.
-	metaFile, err := os.OpenFile(metaPath, os.O_RDWR|os.O_CREATE, 0600)
+	// Write metadata to a temporary file then rename for atomicity.
+	tmpMetaPath := metaPath + ".tmp"
+	metaFile, err := os.OpenFile(tmpMetaPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
 	}
-
-	defer metaFile.Close()
+	defer func() {
+		metaFile.Close()
+		_ = os.Remove(tmpMetaPath)
+	}()
 
 	t.version++
 
-	metaBuf := make([]byte, 4096) // Use a full page for atomicity
+	metaBuf := make([]byte, 4096)
 	binary.LittleEndian.PutUint32(metaBuf[0:4], treeMetaMagic)
 	binary.LittleEndian.PutUint32(metaBuf[4:8], treeMetaVersion)
 	binary.LittleEndian.PutUint64(metaBuf[8:16], t.maxLoff)
@@ -762,21 +798,19 @@ func (t *Tree) Sync(metaPath, nodePath string) error {
 	binary.LittleEndian.PutUint64(metaBuf[36:44], t.maxNodeID)
 	binary.LittleEndian.PutUint64(metaBuf[44:52], t.rootID)
 
-	// Compute checksum for the first 52 bytes.
 	c := crc32.ChecksumIEEE(metaBuf[:52])
 	binary.LittleEndian.PutUint32(metaBuf[52:56], c)
 
-	// Write to one of the two meta pages (ping-pong for atomicity).
-	off := int64(0)
-	if t.version%2 != 0 {
-		off = 4096
-	}
-
-	if _, err := metaFile.WriteAt(metaBuf, off); err != nil {
+	if _, err := metaFile.Write(metaBuf); err != nil {
 		return err
 	}
-
 	if err := metaFile.Sync(); err != nil {
+		return err
+	}
+	if err := metaFile.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpMetaPath, metaPath); err != nil {
 		return err
 	}
 

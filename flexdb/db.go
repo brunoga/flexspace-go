@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -65,6 +66,9 @@ const (
 
 	tableRegistryMagic   = 0x464C5852 // 'FLXR'
 	tableRegistryVersion = 1
+
+	// memtableFlushBatch is the internal batch size used by flushMT.
+	memtableFlushBatch = 1024
 )
 
 // Options contains configuration for a FlexDB instance.
@@ -122,7 +126,7 @@ func Open(ctx context.Context, path string, opts *Options) (*DB, error) {
 		return nil, fmt.Errorf("flexdb open: load tables: %w", err)
 	}
 
-	// Replay WAL logs into the memtables; restore the sequence counter.
+	// Replay WAL logs into the memtables now that tables are loaded.
 	var maxSeq uint64
 	for i, mt := range db.memtables {
 		logPath := filepath.Join(db.path, fmt.Sprintf("MEMTABLE_LOG%d", i))
@@ -138,10 +142,23 @@ func Open(ctx context.Context, path string, opts *Options) (*DB, error) {
 	db.seqNum.Store(maxSeq)
 
 	// Flush replayed entries to the correct tables' flexfiles.
+	needsSync := false
 	for _, mt := range db.memtables {
 		if mt.m.First().Valid() {
-			db.flushMT(mt)
-			mt.reset()
+			needsSync = true
+			if err := db.flushMT(mt); err != nil {
+				slog.Error("flexdb open: WAL replay flushMT error", "err", err)
+			} else {
+				if err := mt.truncateLog(); err != nil {
+					slog.Error("flexdb open: WAL replay truncateLog error", "err", err)
+				}
+				mt.reset()
+			}
+		}
+	}
+	if needsSync {
+		if err := db.Sync(ctx); err != nil {
+			slog.Error("flexdb open: initial Sync failed", "err", err)
 		}
 	}
 
@@ -269,7 +286,7 @@ func (db *DB) closeAll() error {
 	db.tablesMu.RLock()
 	defer db.tablesMu.RUnlock()
 	for _, t := range db.tablesByID {
-		if err := t.ff.Close(); err != nil && firstErr == nil {
+		if err := t.close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -279,10 +296,13 @@ func (db *DB) closeAll() error {
 // Sync forces a full flush of all pending writes to the flexfiles.
 // Returns the first error encountered in the flush path, if any.
 func (db *DB) Sync(ctx context.Context) error {
-	if db.flushWorker != nil {
-		db.flushWorker.triggerImmediate()
-	}
 	db.flushActiveMT()
+	// If the immutable memtable still has pending data from a previously
+	// failed flush (e.g., after storage error recovery), retry it now so
+	// Sync provides the expected durability guarantee.
+	if immut := db.immutableMT(); immut.size.Load() > 0 {
+		db.swapAndFlush()
+	}
 	db.tablesMu.RLock()
 	for _, t := range db.tablesByID {
 		select {
@@ -294,7 +314,9 @@ func (db *DB) Sync(ctx context.Context) error {
 		if err := t.ff.Sync(); err != nil {
 			db.setFlushErr(err)
 		}
-		t.blobs.sync()
+		if err := t.blobs.sync(); err != nil {
+			db.setFlushErr(err)
+		}
 	}
 	db.tablesMu.RUnlock()
 	db.flushErrMu.Lock()
@@ -323,8 +345,8 @@ func (db *DB) Stats() DBStats {
 	return DBStats{
 		Seq:             db.seqNum.Load(),
 		TableCount:      tableCount,
-		ActiveMTBytes:   db.activeMT().size.Load(),
-		InactiveMTBytes: db.immutableMT().size.Load(),
+		ActiveMTBytes:   int64(db.activeMT().size.Load()),
+		InactiveMTBytes: int64(db.immutableMT().size.Load()),
 	}
 }
 
@@ -357,6 +379,48 @@ func (db *DB) swapAndFlush() {
 	db.flushMu.Lock()
 	defer db.flushMu.Unlock()
 
+	immut := db.immutableMT()
+	if immut.size.Load() > 0 {
+		// Previous flush failed. Rebuild each table's in-memory index from disk
+		// so the retry sees a state consistent with the on-disk flexfile rather
+		// than the partially-updated tree left by the failed attempt.
+		db.tablesMu.RLock()
+		for _, t := range db.tablesByID {
+			for i := range t.rwFF {
+				t.rwFF[i].Lock()
+			}
+			t.tree = newDBTree()
+			t.cache = newDBCache(db, t.ff, db.capMB)
+			if t.ff.Size() > 0 {
+				if err := t.rebuildIndex(); err != nil {
+					slog.Error("flexdb: rebuildIndex failed on flush retry", "err", err)
+				}
+			}
+			for i := range t.rwFF {
+				t.rwFF[i].Unlock()
+			}
+		}
+		db.tablesMu.RUnlock()
+
+		// Try again before swapping.
+		if err := db.flushMT(immut); err != nil {
+			db.setFlushErr(err)
+			return
+		}
+		if err := immut.truncateLog(); err != nil {
+			db.setFlushErr(fmt.Errorf("flexdb: truncate WAL: %w", err))
+		}
+		for i := range db.rwMT {
+			db.rwMT[i].Lock()
+		}
+		immut.hidden.Store(true)
+		immut.reset()
+		immut.hidden.Store(false)
+		for i := range db.rwMT {
+			db.rwMT[i].Unlock()
+		}
+	}
+
 	for i := range db.rwMT {
 		db.rwMT[i].Lock()
 	}
@@ -366,36 +430,34 @@ func (db *DB) swapAndFlush() {
 		db.rwMT[i].Unlock()
 	}
 
-	immut := db.memtables[old]
+	immut = db.memtables[old]
 
 	if err := immut.flushLog(); err != nil {
 		db.setFlushErr(fmt.Errorf("flexdb: flush WAL: %w", err))
-		// WAL buffer not fully on disk; proceed anyway — data is in skip-list
-		// and will be written to flexfiles below.
 	}
 	db.metrics.WALFlushCount.Add(1)
 
 	if err := db.flushMT(immut); err != nil {
 		db.setFlushErr(err)
-		// Don't truncate WAL: data may not have reached flexfiles.
-		// BUT we MUST reset the memtable so the active MT can rotate,
-		// otherwise Put() will hang forever spinning on isFull().
-	} else {
-		db.metrics.FlushBatchCount.Add(1)
-		db.tablesMu.RLock()
+		// Don't truncate WAL and don't reset memtable. We keep the data
+		// in memory so it can be retried and remains visible to Get().
+		return
+	}
 
-		for _, t := range db.tablesByID {
-			if err := t.ff.Sync(); err != nil {
-				db.setFlushErr(err)
-			}
-			t.blobs.sync()
+	db.metrics.FlushBatchCount.Add(1)
+	db.tablesMu.RLock()
+	for _, t := range db.tablesByID {
+		if err := t.ff.Sync(); err != nil {
+			db.setFlushErr(err)
 		}
-
-		db.tablesMu.RUnlock()
-
-		if err := immut.truncateLog(); err != nil {
-			db.setFlushErr(fmt.Errorf("flexdb: truncate WAL: %w", err))
+		if err := t.blobs.sync(); err != nil {
+			db.setFlushErr(err)
 		}
+	}
+	db.tablesMu.RUnlock()
+
+	if err := immut.truncateLog(); err != nil {
+		db.setFlushErr(fmt.Errorf("flexdb: truncate WAL: %w", err))
 	}
 
 	for i := range db.rwMT {

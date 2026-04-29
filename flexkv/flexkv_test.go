@@ -268,6 +268,71 @@ func TestDropTable(t *testing.T) {
 	}
 }
 
+func TestBatch(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t, "test_batch")
+	tbl := mustTable(t, db, "data")
+
+	// Basic: put two keys atomically, both must be visible after commit.
+	b := db.NewBatch()
+	b.Put(tbl, []byte("k1"), []byte("v1"))
+	b.Put(tbl, []byte("k2"), []byte("v2"))
+	ok, err := b.Commit(ctx)
+	if !ok || err != nil {
+		t.Fatalf("Commit: ok=%v err=%v", ok, err)
+	}
+	for _, tc := range []struct{ k, want string }{{"k1", "v1"}, {"k2", "v2"}} {
+		v, err := tbl.Get(ctx, []byte(tc.k))
+		if err != nil || string(v) != tc.want {
+			t.Errorf("Get(%q): got %q err=%v, want %q", tc.k, v, err, tc.want)
+		}
+	}
+
+	// Delete in a batch removes the key.
+	b2 := db.NewBatch()
+	b2.Delete(tbl, []byte("k1"))
+	if ok, err := b2.Commit(ctx); !ok || err != nil {
+		t.Fatalf("Commit delete: ok=%v err=%v", ok, err)
+	}
+	if v, _ := tbl.Get(ctx, []byte("k1")); v != nil {
+		t.Errorf("k1 should be deleted, got %q", v)
+	}
+
+	// Check passes when expected value matches; writes are applied.
+	b3 := db.NewBatch()
+	b3.Check(tbl, []byte("k2"), []byte("v2"))
+	b3.Put(tbl, []byte("k2"), []byte("v2-updated"))
+	if ok, err := b3.Commit(ctx); !ok || err != nil {
+		t.Fatalf("Commit with passing check: ok=%v err=%v", ok, err)
+	}
+	if v, _ := tbl.Get(ctx, []byte("k2")); string(v) != "v2-updated" {
+		t.Errorf("k2 after checked update: got %q, want v2-updated", v)
+	}
+
+	// Check fails when expected value does not match; no writes applied.
+	b4 := db.NewBatch()
+	b4.Check(tbl, []byte("k2"), []byte("wrong-value"))
+	b4.Put(tbl, []byte("k2"), []byte("should-not-land"))
+	ok, err = b4.Commit(ctx)
+	if ok || err != nil {
+		t.Fatalf("Commit with failing check: ok=%v err=%v, want ok=false err=nil", ok, err)
+	}
+	if v, _ := tbl.Get(ctx, []byte("k2")); string(v) != "v2-updated" {
+		t.Errorf("k2 unchanged after failed check: got %q, want v2-updated", v)
+	}
+
+	// Duplicate keys in a batch: last write wins.
+	b5 := db.NewBatch()
+	b5.Put(tbl, []byte("dup"), []byte("first"))
+	b5.Put(tbl, []byte("dup"), []byte("second"))
+	if ok, err := b5.Commit(ctx); !ok || err != nil {
+		t.Fatalf("Commit dedup: ok=%v err=%v", ok, err)
+	}
+	if v, _ := tbl.Get(ctx, []byte("dup")); string(v) != "second" {
+		t.Errorf("dedup: got %q, want second", v)
+	}
+}
+
 func TestScanPrefix(t *testing.T) {
 	db := openTestDB(t, "test_prefix")
 	tbl := mustTable(t, db, "kv")

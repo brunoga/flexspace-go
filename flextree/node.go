@@ -15,36 +15,12 @@ type path struct {
 	oloff uint64
 }
 
-// parentNode returns the parent node at the current traversal level.
-func (p *path) parentNode() *node {
-	if p.level == 0 {
-		return nil
-	}
-	return p.nodes[p.level-1]
-}
-
-// grandparentNode returns the grandparent node at the current traversal level.
-func (p *path) grandparentNode() *node {
-	if p.level < 2 {
-		return nil
-	}
-	return p.nodes[p.level-2]
-}
-
 // parentIdx returns the index of the current node in its parent.
 func (p *path) parentIdx() uint32 {
 	if p.level == 0 {
 		return ^uint32(0)
 	}
 	return uint32(p.path[p.level-1])
-}
-
-// grandparentIdx returns the index of the parent node in its grandparent.
-func (p *path) grandparentIdx() uint32 {
-	if p.level < 2 {
-		return ^uint32(0)
-	}
-	return uint32(p.path[p.level-2])
 }
 
 // node is the common header. Matches C struct flextree_node exactly.
@@ -490,14 +466,21 @@ func (n *node) insertToLeaf(loff uint32, poff uint64, length uint32, tag uint16)
 	} else {
 		currExtent := &ln.extents[target]
 		if currExtent.loff == loff {
-			if target > 0 && tag == 0 && extentSequential(&ln.extents[target-1], mes, em, loff, poff, length) {
+			// Try merging with the previous extent when both extents are untagged
+			// and physically sequential. The old extent at target (and everything
+			// after it) still needs to be shifted forward by +length.
+			if target > 0 && tag == 0 && ln.extents[target-1].tag() == 0 &&
+				extentSequential(&ln.extents[target-1], mes, em, loff, poff, length) {
 				ln.extents[target-1].len += length
-				shift = 0
-			} else {
-				copy(ln.extents[target+1:], ln.extents[target:n.count])
-				ln.extents[target] = t
-				n.count++
+				for i := int(target); i < int(n.count); i++ {
+					ln.extents[i].loff += length
+				}
+				n.dirty = true
+				return
 			}
+			copy(ln.extents[target+1:], ln.extents[target:n.count])
+			ln.extents[target] = t
+			n.count++
 		} else { // split
 			shift = 2
 			so := loff - currExtent.loff

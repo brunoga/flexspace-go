@@ -3,6 +3,7 @@ package flexfile
 import (
 	"bytes"
 	"os"
+	"syscall"
 	"testing"
 )
 
@@ -48,9 +49,9 @@ func TestFlexFileBasic(t *testing.T) {
 		t.Errorf("expected tag 123, got %d (err: %v)", tag, err)
 	}
 
-	// Test Write (Update)
+	// Test Update (in-place overwrite)
 	newData := []byte("HELLO")
-	n, err = ff.Write(newData, 0)
+	n, err = ff.Update(newData, 0, uint64(len(newData)))
 	if err != nil {
 		t.Fatalf("write failed: %v", err)
 	}
@@ -109,6 +110,66 @@ func TestFlexFilePersistence(t *testing.T) {
 		if !bytes.Equal(readBuf, data) {
 			t.Errorf("expected %s, got %s", string(data), string(readBuf))
 		}
+	}
+}
+
+// TestFlexFileWALReplay verifies that redoLog() restores data written before a
+// crash (i.e. after Sync() but before a clean Close() checkpoints the tree).
+func TestFlexFileWALReplay(t *testing.T) {
+	path := t.TempDir()
+	data1 := []byte("wal replay block one")
+	data2 := []byte("wal replay block two")
+
+	// Write data, flush both data and WAL to disk, then "crash" by closing the
+	// raw file descriptors without going through Close() (which would checkpoint
+	// the tree and truncate the log).
+	func() {
+		ff, err := Open(path)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		if _, err := ff.Insert(data1, 0); err != nil {
+			t.Fatalf("insert data1: %v", err)
+		}
+		if _, err := ff.Insert(data2, uint64(len(data1))); err != nil {
+			t.Fatalf("insert data2: %v", err)
+		}
+		// Sync flushes data block + WAL to disk. Log threshold not crossed, so
+		// no tree checkpoint is written and the LOG file is not truncated.
+		if err := ff.Sync(); err != nil {
+			t.Fatalf("sync: %v", err)
+		}
+		// Simulate crash: release resources without checkpointing or truncating.
+		ff.bm.close()
+		for i, chunk := range ff.chunks {
+			if chunk != nil {
+				syscall.Munmap(chunk)
+				ff.chunks[i] = nil
+			}
+		}
+		ff.dataFile.Close()
+		ff.logFile.Close()
+		ff.checksumFile.Close()
+	}()
+
+	// Reopen: redoLog() must replay the WAL entries and restore the tree.
+	ff, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen after crash: %v", err)
+	}
+	defer ff.Close()
+
+	total := uint64(len(data1) + len(data2))
+	if got := ff.Size(); got != total {
+		t.Errorf("size after WAL replay: got %d, want %d", got, total)
+	}
+	buf := make([]byte, len(data1))
+	if n, err := ff.Read(buf, 0); err != nil || n != len(data1) || !bytes.Equal(buf, data1) {
+		t.Errorf("data1 after replay: got %q (n=%d, err=%v), want %q", buf, n, err, data1)
+	}
+	buf2 := make([]byte, len(data2))
+	if n, err := ff.Read(buf2, uint64(len(data1))); err != nil || n != len(data2) || !bytes.Equal(buf2, data2) {
+		t.Errorf("data2 after replay: got %q (n=%d, err=%v), want %q", buf2, n, err, data2)
 	}
 }
 

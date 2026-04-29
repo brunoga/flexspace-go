@@ -1,6 +1,8 @@
 package flexdb
 
-import "github.com/brunoga/flexspace-go/flexfile"
+import (
+	"github.com/brunoga/flexspace-go/flexfile"
+)
 
 // Storage is the pluggable persistence layer for a Table. It abstracts the
 // ordered, tagged extent store that flexfile provides today. A future
@@ -26,8 +28,11 @@ type Storage interface {
 	SetTag(loff uint64, tag uint16) error
 
 	// IterateExtents calls fn for each extent in [start, end).
-	// Iteration stops when fn returns false.
-	IterateExtents(start, end uint64, fn func(loff uint64, tag uint16, data []byte) bool)
+	// Iteration stops when fn returns false or an error occurs.
+	IterateExtents(start, end uint64, fn func(loff uint64, tag uint16, data []byte) bool) error
+
+	// SetMetrics associates performance counters with this Storage.
+	SetMetrics(m flexfile.Metrics)
 
 	// Size returns the total logical size of the store in bytes.
 	Size() uint64
@@ -37,9 +42,6 @@ type Storage interface {
 
 	// Close releases all resources held by the store.
 	Close() error
-
-	// SetMetrics attaches a metrics collector to the store.
-	SetMetrics(m flexfile.Metrics)
 }
 
 // openStorage opens the default flexfile-backed Storage at path.
