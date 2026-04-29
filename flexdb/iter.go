@@ -69,12 +69,12 @@ func (it *Iterator) Seek(key []byte) {
 	// Build prefixed start key for memtable seek.
 	// When key is non-nil, borrow a pooled buffer (Seek does not retain the key).
 	var pkey []byte
-	var pkeyBuf []byte // non-nil when pooled; must be returned after seeks complete
+	var pkeyBuf *[]byte // non-nil when pooled; must be returned after seeks complete
 	if key == nil {
 		pkey = it.tableIDBytes[:]
 	} else {
-		pkeyBuf = pkeyPool.Get().([]byte)
-		pkey = pkeyBuf[:4+len(key)]
+		pkeyBuf = pkeyPool.Get().(*[]byte)
+		pkey = (*pkeyBuf)[:4+len(key)]
 		copy(pkey, it.tableIDBytes[:])
 		copy(pkey[4:], key)
 	}
@@ -109,7 +109,7 @@ func (it *Iterator) Seek(key []byte) {
 
 	// Return the pooled pkey buffer now that all seeks are done.
 	if pkeyBuf != nil {
-		pkeyPool.Put(pkeyBuf[:cap(pkeyBuf)])
+		pkeyPool.Put(pkeyBuf)
 		pkeyBuf = nil
 	}
 

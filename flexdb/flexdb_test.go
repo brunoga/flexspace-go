@@ -179,7 +179,7 @@ func TestSyncAndReopen(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		ref.Sync(context.Background())
+		db.Sync(context.Background()) //nolint:errcheck
 		if err := db.Close(); err != nil {
 			t.Fatal(err)
 		}
@@ -300,7 +300,7 @@ func TestSyncReopenLarge(t *testing.T) {
 				t.Fatalf("Put %d: %v", i, err)
 			}
 		}
-		ref.Sync(context.Background())
+		db.Sync(context.Background()) //nolint:errcheck
 		db.Close()
 	}
 	{
@@ -339,7 +339,7 @@ func TestIteratorAfterSync(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	ref.Sync(context.Background())
+	db.Sync(context.Background()) //nolint:errcheck
 	sort.Strings(keys)
 
 	it := ref.NewIterator()
@@ -397,9 +397,9 @@ func TestSeqMonotonic(t *testing.T) {
 	ref := tbl.NewRef()
 
 	s0 := db.Seq()
-	ref.Put(context.Background(), []byte("a"), []byte("1"))
+	ref.Put(context.Background(), []byte("a"), []byte("1")) //nolint:errcheck
 	s1 := db.Seq()
-	ref.Put(context.Background(), []byte("b"), []byte("2"))
+	ref.Put(context.Background(), []byte("b"), []byte("2")) //nolint:errcheck
 	s2 := db.Seq()
 	if !(s0 < s1 && s1 < s2) {
 		t.Fatalf("seq not monotonic: %d %d %d", s0, s1, s2)
@@ -408,14 +408,14 @@ func TestSeqMonotonic(t *testing.T) {
 	batch := db.NewBatch()
 	batch.Put(tbl, []byte("c"), []byte("3"))
 	batch.Put(tbl, []byte("d"), []byte("4"))
-	batch.Commit(context.Background())
+	batch.Commit(context.Background()) //nolint:errcheck
 	s3 := db.Seq()
 	if s3 <= s2 {
 		t.Fatalf("batch did not advance seq: %d → %d", s2, s3)
 	}
 
 	// Reopen: seq must be restored to at least s3.
-	ref.Sync(context.Background())
+	ref.Sync(context.Background()) //nolint:errcheck
 	db.Close()
 
 	db2 := mustOpenDB(t, dir)
@@ -435,8 +435,8 @@ func TestConditionalBatch(t *testing.T) {
 	r1 := t1.NewRef()
 	r2 := t2.NewRef()
 
-	r1.Put(context.Background(), []byte("a"), []byte("1"))
-	r2.Put(context.Background(), []byte("b"), []byte("2"))
+	r1.Put(context.Background(), []byte("a"), []byte("1")) //nolint:errcheck
+	r2.Put(context.Background(), []byte("b"), []byte("2")) //nolint:errcheck
 
 	// Batch with correct conditions → should commit.
 	batch := db.NewBatch()
@@ -492,8 +492,8 @@ func TestConditionalBatchAfterSync(t *testing.T) {
 
 	tbl := mustTable(t, db, "t")
 	ref := tbl.NewRef()
-	ref.Put(context.Background(), []byte("k"), []byte("v1"))
-	ref.Sync(context.Background())
+	ref.Put(context.Background(), []byte("k"), []byte("v1")) //nolint:errcheck
+	db.Sync(context.Background())                            //nolint:errcheck
 
 	// Value is on disk; condition should still see it.
 	batch := db.NewBatch()
@@ -516,8 +516,8 @@ func TestMultipleTables(t *testing.T) {
 	t1 := mustTable(t, db, "t1")
 	t2 := mustTable(t, db, "t2")
 
-	t1.NewRef().Put(context.Background(), []byte("key"), []byte("val1"))
-	t2.NewRef().Put(context.Background(), []byte("key"), []byte("val2"))
+	t1.NewRef().Put(context.Background(), []byte("key"), []byte("val1")) //nolint:errcheck
+	t2.NewRef().Put(context.Background(), []byte("key"), []byte("val2")) //nolint:errcheck
 
 	v1, _ := t1.NewRef().Get(context.Background(), []byte("key"))
 	v2, _ := t2.NewRef().Get(context.Background(), []byte("key"))
@@ -604,7 +604,7 @@ func TestUpdateCASAfterSync(t *testing.T) {
 	key := []byte("k")
 
 	ref.Put(context.Background(), key, []byte("v1"))
-	ref.Sync(context.Background())
+	db.Sync(context.Background()) //nolint:errcheck
 
 	// Value is now on disk. CAS should still see it.
 	ok, err := ref.Update(context.Background(), key, []byte("v1"), []byte("v2"))
@@ -623,7 +623,7 @@ func TestDropTable(t *testing.T) {
 	defer db.Close()
 
 	tbl := mustTable(t, db, "items")
-	tbl.NewRef().Put(context.Background(), []byte("k1"), []byte("v1"))
+	tbl.NewRef().Put(context.Background(), []byte("k1"), []byte("v1")) //nolint:errcheck
 
 	if err := db.DropTable(context.Background(), "items"); err != nil {
 		t.Fatalf("DropTable: %v", err)
@@ -675,7 +675,7 @@ func TestBlobPutGet(t *testing.T) {
 	}
 
 	// Force flush to flexfile and read back from disk.
-	db.Sync(context.Background())
+	db.Sync(context.Background()) //nolint:errcheck
 	got2, err := ref.Get(context.Background(), key)
 	if err != nil {
 		t.Fatalf("Get (disk): %v", err)
@@ -747,7 +747,7 @@ func TestBlobIterator(t *testing.T) {
 			t.Fatalf("Put %q: %v", k, err)
 		}
 	}
-	db.Sync(context.Background())
+	db.Sync(context.Background()) //nolint:errcheck
 
 	it := ref.NewIterator()
 	defer it.Close()
@@ -792,7 +792,7 @@ func TestBlobDelete(t *testing.T) {
 		t.Fatalf("Delete: %v", err)
 	}
 
-	db.Sync(context.Background())
+	db.Sync(context.Background()) //nolint:errcheck
 
 	got, err := ref.Get(context.Background(), key)
 	if err != nil {
@@ -830,7 +830,7 @@ func TestBlobBatch(t *testing.T) {
 		t.Fatal("Commit returned false")
 	}
 
-	db.Sync(context.Background())
+	db.Sync(context.Background()) //nolint:errcheck
 
 	got, err := ref.Get(context.Background(), []byte("large"))
 	if err != nil {

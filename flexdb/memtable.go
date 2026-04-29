@@ -100,8 +100,8 @@ func (mt *memtable) probe(pkey []byte) int {
 }
 
 func (mt *memtable) logAppend(pkey, value []byte, seq uint64) error {
-	kvSz := uint64(kv128EncodedSize(len(pkey), len(value)))
-	needed := 8 + 8 + int(kvSz) // sz:8 + seq:8 + KV
+	kvSz := uint32(kv128EncodedSize(len(pkey), len(value)))
+	needed := 4 + 8 + int(kvSz) // sz:4 + seq:8 + KV
 
 	mt.mu.Lock()
 	if mt.logOff+needed > len(mt.logBuf) {
@@ -111,9 +111,9 @@ func (mt *memtable) logAppend(pkey, value []byte, seq uint64) error {
 		}
 	}
 
-	binary.LittleEndian.PutUint64(mt.logBuf[mt.logOff:], kvSz)
-	binary.LittleEndian.PutUint64(mt.logBuf[mt.logOff+8:], seq)
-	encodeKV128Data(mt.logBuf[mt.logOff+16:], pkey, value)
+	binary.LittleEndian.PutUint32(mt.logBuf[mt.logOff:], kvSz)
+	binary.LittleEndian.PutUint64(mt.logBuf[mt.logOff+4:], seq)
+	encodeKV128Data(mt.logBuf[mt.logOff+12:], pkey, value)
 	mt.logOff += needed
 	mt.mu.Unlock()
 	return nil
@@ -128,22 +128,22 @@ type walBatchOp struct {
 //
 // Format (size-prefixed):
 //
-//	  [sentinel:8]       (0 identifies a batch)
+//	  [sentinel:4]       (0 identifies a batch)
 //	  [payload_size:8]
 //	  [seq:8]            sequence number of the batch
 //	  [op_count:4]       number of ops in the batch
 //	  for each op:
-//		  [kv_size:8]         size of the encoded KV
+//		  [kv_size:4]         size of the encoded KV
 //		  [VI128 KV...]       tableID-prefixed key + value
 //
 // Callers must hold all rwMT write locks to guarantee atomicity.
 func (mt *memtable) logAppendBatch(ops []walBatchOp, seq uint64) error {
 	payloadSize := 8 + 4
 	for _, op := range ops {
-		kvSz := uint64(kv128EncodedSize(len(op.pkey), len(op.value)))
-		payloadSize += 8 + int(kvSz)
+		kvSz := uint32(kv128EncodedSize(len(op.pkey), len(op.value)))
+		payloadSize += 4 + int(kvSz)
 	}
-	needed := 8 + 8 + payloadSize // sentinel + payload_size + payload
+	needed := 4 + 8 + payloadSize // sentinel + payload_size + payload
 
 	mt.mu.Lock()
 	if mt.logOff+needed > len(mt.logBuf) {
@@ -154,16 +154,16 @@ func (mt *memtable) logAppendBatch(ops []walBatchOp, seq uint64) error {
 	}
 
 	buf := mt.logBuf[mt.logOff:]
-	binary.LittleEndian.PutUint64(buf[0:8], batchSentinel)
-	binary.LittleEndian.PutUint64(buf[8:16], uint64(payloadSize))
-	binary.LittleEndian.PutUint64(buf[16:24], seq)
-	binary.LittleEndian.PutUint32(buf[24:28], uint32(len(ops)))
+	binary.LittleEndian.PutUint32(buf[0:4], batchSentinel)
+	binary.LittleEndian.PutUint64(buf[4:12], uint64(payloadSize))
+	binary.LittleEndian.PutUint64(buf[12:20], seq)
+	binary.LittleEndian.PutUint32(buf[20:24], uint32(len(ops)))
 
-	off := 28
+	off := 24
 	for _, op := range ops {
-		kvSz := uint64(kv128EncodedSize(len(op.pkey), len(op.value)))
-		binary.LittleEndian.PutUint64(buf[off:], kvSz)
-		off += 8
+		kvSz := uint32(kv128EncodedSize(len(op.pkey), len(op.value)))
+		binary.LittleEndian.PutUint32(buf[off:], kvSz)
+		off += 4
 		encodeKV128Data(buf[off:], op.pkey, op.value)
 		off += int(kvSz)
 	}
@@ -245,9 +245,9 @@ func (mt *memtable) redoLog(path string) (uint64, error) {
 		off = 16
 	}
 
-	for off+8 <= len(buf) {
-		sz := int(binary.LittleEndian.Uint64(buf[off:]))
-		off += 8
+	for off+4 <= len(buf) {
+		sz := int(binary.LittleEndian.Uint32(buf[off:]))
+		off += 4
 
 		if sz == 0 {
 			// Batch record: [payload_size:8][seq:8][op_count:4][ops...]
@@ -275,12 +275,12 @@ func (mt *memtable) redoLog(path string) (uint64, error) {
 			var batchOps []walBatchOp
 			corrupted := false
 			for op := 0; op < opCount; op++ {
-				if off+8 > batchEnd {
+				if off+4 > batchEnd {
 					corrupted = true
 					break
 				}
-				kvSize := int(binary.LittleEndian.Uint64(buf[off:]))
-				off += 8
+				kvSize := int(binary.LittleEndian.Uint32(buf[off:]))
+				off += 4
 				if off+kvSize > batchEnd {
 					corrupted = true
 					break
@@ -301,7 +301,7 @@ func (mt *memtable) redoLog(path string) (uint64, error) {
 			}
 			off = batchEnd
 		} else {
-			// Single-op record: [sz:8 already consumed][seq:8][KV(sz bytes)]
+			// Single-op record: [sz:4 already consumed][seq:8][KV(sz bytes)]
 			if off+8 > len(buf) {
 				break
 			}

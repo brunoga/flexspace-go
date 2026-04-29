@@ -120,22 +120,39 @@ MEMTABLE_LOG1
 ```
 
 Two WAL files alternate as the active/immutable buffers. Each file begins with:
-- `[timestamp:8][seqNum:8]`
+- `[timestamp:8][seqNum:8]` — both Little-Endian; `timestamp` is a Unix epoch uint64 (seconds), `seqNum` is the last committed sequence number
 
 Followed by variable-length records:
 
 **Single-op record:**
 ```
-[kv_size:8][seq:8][VI128-encoded key+value]
+[kv_size:4][seq:8][VI128-encoded key+value]
 ```
 
 **Batch record** (atomic, all-or-nothing on crash recovery):
 ```
-[0:8 sentinel][payload_size:8][seq:8][op_count:4]
-  for each op: [kv_size:8][VI128-encoded prefixed-key+value]
+[0:4 sentinel][payload_size:8][seq:8][op_count:4]
+  for each op: [kv_size:4][VI128-encoded prefixed-key+value]
 ```
 
 The `seq` field is stored in the header on truncation so that `DB.Seq()` is correct even after all data is flushed and the WAL body is empty.
+
+---
+
+## Blob Storage
+
+Values where `len(key)+len(value) > MaxKVSize` (4 KiB) are stored out-of-line in a per-table `BLOBFILE`. The memtable and on-disk intervals hold a 16-byte **blob sentinel** in place of the value:
+
+```
+[magic:4 = 0xB10BB10B][offset:8][size:4]   (all Little-Endian)
+```
+
+- `offset` — absolute byte offset in `BLOBFILE` where the value starts.
+- `size` — uncompressed byte length of the value.
+
+The `BLOBFILE` begins with a 4-byte magic `0x46424C4F` (`'FBLO'`) followed by raw blob data written sequentially. Each blob is fdatasynced before its sentinel enters the WAL, so a crash after the WAL write never leaves a dangling reference.
+
+`Get` / `Update` / iterator reads transparently detect the sentinel and fetch the value from `BLOBFILE`. The maximum allowed value size is `MaxBlobSize` (1 GiB).
 
 ---
 
@@ -180,8 +197,11 @@ db-path/
 ├── MEMTABLE_LOG1
 ├── TABLE_REGISTRY
 └── tables/
-    ├── 1/FLEXFILE/   (DATA, LOG, FLEXTREE_META, FLEXTREE_NODE)
-    ├── 2/FLEXFILE/
+    ├── 1/
+    │   ├── BLOBFILE          (large value store, created on first blob write)
+    │   └── FLEXFILE/         (DATA, LOG, FLEXTREE_META, FLEXTREE_NODE)
+    ├── 2/
+    │   └── FLEXFILE/
     └── …
 ```
 

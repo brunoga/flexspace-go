@@ -752,19 +752,19 @@ func restoreSnapshot(t *testing.T, snap dirSnapshot, dst string) {
 // walRecordSize returns the on-disk byte size of a single-op WAL record for a
 // key of userKeyLen bytes and a value of valueLen bytes, given the table ID.
 // This mirrors the layout written by memtable.logAppend.
-func walRecordSize(tableID uint32, userKeyLen, valueLen int) int {
+func walRecordSize(userKeyLen, valueLen int) int {
 	pkeyLen := 4 + userKeyLen                          // 4-byte big-endian table ID prefix
-	return 8 + 8 + kv128EncodedSize(pkeyLen, valueLen) // sz:8 + seq:8 + KV
+	return 4 + 8 + kv128EncodedSize(pkeyLen, valueLen) // sz:4 + seq:8 + KV
 }
 
 // walBatchRecordSize returns the on-disk byte size of a two-op batch WAL
 // record where both ops share the same key/value lengths.
 // This mirrors the layout written by memtable.logAppendBatch.
-func walBatchRecordSize(tableID uint32, userKeyLen, valueLen int) int {
+func walBatchRecordSize(userKeyLen, valueLen int) int {
 	pkeyLen := 4 + userKeyLen
-	perOp := 8 + kv128EncodedSize(pkeyLen, valueLen) // kv_size:8 + KV
+	perOp := 4 + kv128EncodedSize(pkeyLen, valueLen) // kv_size:4 + KV
 	payloadSize := 8 + 4 + 2*perOp                   // seq:8 + op_count:4 + 2 ops
-	return 8 + 8 + payloadSize                       // sentinel:8 + payload_size:8 + payload
+	return 4 + 8 + payloadSize                       // sentinel:4 + payload_size:8 + payload
 }
 
 // TestWALTornSingleOp verifies that a WAL file truncated mid-record (simulating
@@ -809,7 +809,7 @@ func TestWALTornSingleOp(t *testing.T) {
 
 	walData := snap["MEMTABLE_LOG0"]
 	const walHeader = 16
-	recSize := walRecordSize(1, len(userKey), len(userVal))
+	recSize := walRecordSize(len(userKey), len(userVal))
 	wantSize := walHeader + nRecords*recSize
 	if len(walData) != wantSize {
 		t.Fatalf("WAL size mismatch: want %d got %d (recSize=%d)", wantSize, len(walData), recSize)
@@ -821,8 +821,8 @@ func TestWALTornSingleOp(t *testing.T) {
 		wantRecords int
 	}{
 		{"header-only", walHeader, 0},
-		{"mid-size-field", walHeader + 4, 0},
-		{"mid-kv-data", walHeader + 8 + 8 + 2, 0},
+		{"mid-size-field", walHeader + 2, 0},
+		{"mid-kv-data", walHeader + 4 + 8 + 2, 0},
 		{"one-complete", walHeader + recSize, 1},
 		{"four-complete-plus-one-byte", walHeader + 4*recSize + 1, 4},
 		{"nine-complete", walHeader + 9*recSize, 9},
@@ -912,7 +912,7 @@ func TestWALTornBatch(t *testing.T) {
 
 	walData := snap["MEMTABLE_LOG0"]
 	const walHeader = 16
-	batchSize := walBatchRecordSize(1, len(aKey), len(aVal))
+	batchSize := walBatchRecordSize(len(aKey), len(aVal))
 	wantSize := walHeader + nBatches*batchSize
 	if len(walData) != wantSize {
 		t.Fatalf("WAL size mismatch: want %d got %d (batchSize=%d)", wantSize, len(walData), batchSize)
@@ -924,8 +924,8 @@ func TestWALTornBatch(t *testing.T) {
 		wantComplete int // number of fully recovered batches
 	}{
 		{"header-only", walHeader, 0},
-		{"mid-first-sentinel", walHeader + 4, 0},
-		{"mid-first-payload", walHeader + 8 + 8 + 4, 0},
+		{"mid-first-sentinel", walHeader + 2, 0},
+		{"mid-first-payload", walHeader + 4 + 8 + 4, 0},
 		{"one-complete-batch", walHeader + batchSize, 1},
 		{"two-complete-plus-mid", walHeader + 2*batchSize + batchSize/2, 2},
 		{"four-complete", walHeader + 4*batchSize, 4},

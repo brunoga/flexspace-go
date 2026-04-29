@@ -51,11 +51,14 @@ func TestFlexFileBasic(t *testing.T) {
 
 	// Test Update (in-place overwrite)
 	newData := []byte("HELLO")
-	n, err = ff.Update(newData, 0, uint64(len(newData)))
+	_, err = ff.Update(newData, 0, uint64(len(newData)))
 	if err != nil {
 		t.Fatalf("write failed: %v", err)
 	}
-	n, err = ff.Read(readBuf, 0)
+	_, err = ff.Read(readBuf, 0)
+	if err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
 	if string(readBuf[:5]) != "HELLO" {
 		t.Errorf("expected HELLO, got %s", string(readBuf[:5]))
 	}
@@ -83,9 +86,15 @@ func TestFlexFilePersistence(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to open flexfile: %v", err)
 		}
-		ff.Insert(data, 0)
-		ff.SetTag(0, tagValue)
-		ff.Sync()
+		if _, err := ff.Insert(data, 0); err != nil {
+			t.Errorf("insert failed: %v", err)
+		}
+		if err := ff.SetTag(0, tagValue); err != nil {
+			t.Errorf("set tag failed: %v", err)
+		}
+		if err := ff.Sync(); err != nil {
+			t.Errorf("sync failed: %v", err)
+		}
 		ff.Close()
 	}
 
@@ -106,7 +115,9 @@ func TestFlexFilePersistence(t *testing.T) {
 		}
 
 		readBuf := make([]byte, len(data))
-		ff.Read(readBuf, 0)
+		if _, err := ff.Read(readBuf, 0); err != nil {
+			t.Errorf("read failed: %v", err)
+		}
 		if !bytes.Equal(readBuf, data) {
 			t.Errorf("expected %s, got %s", string(data), string(readBuf))
 		}
@@ -143,7 +154,7 @@ func TestFlexFileWALReplay(t *testing.T) {
 		ff.bm.close()
 		for i, chunk := range ff.chunks {
 			if chunk != nil {
-				syscall.Munmap(chunk)
+				_ = syscall.Munmap(chunk)
 				ff.chunks[i] = nil
 			}
 		}
@@ -202,7 +213,9 @@ func BenchmarkFlexFileInsert(b *testing.B) {
 		b.StartTimer()
 
 		for j := 0; j < benchNumOps && i < b.N; j++ {
-			ff.Insert(data, uint64(j*benchOpSize))
+			if _, err := ff.Insert(data, uint64(j*benchOpSize)); err != nil {
+				b.Fatal(err)
+			}
 			i++
 		}
 		i--
@@ -222,16 +235,22 @@ func BenchmarkFlexFileRead(b *testing.B) {
 	defer os.RemoveAll(dir)
 	ff, _ := Open(dir)
 	for j := 0; j < benchNumOps; j++ {
-		ff.Insert(data, uint64(j*benchOpSize))
+		if _, err := ff.Insert(data, uint64(j*benchOpSize)); err != nil {
+			b.Fatal(err)
+		}
 	}
-	ff.Sync()
+	if err := ff.Sync(); err != nil {
+		b.Fatal(err)
+	}
 
 	buf := make([]byte, benchOpSize)
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		ff.Read(buf, uint64((i%benchNumOps)*benchOpSize))
+		if _, err := ff.Read(buf, uint64((i%benchNumOps)*benchOpSize)); err != nil {
+			b.Fatal(err)
+		}
 	}
 
 	b.StopTimer()

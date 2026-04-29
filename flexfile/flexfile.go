@@ -200,9 +200,9 @@ func (ff *FlexFile) redoLog() error {
 	off := int64(0)
 	entrySize := int64(logEntrySize)
 	if totalSize >= 16 {
-		magic := binary.BigEndian.Uint32(fullBuf[0:4])
+		magic := binary.LittleEndian.Uint32(fullBuf[0:4])
 		if magic == logMagic {
-			version := binary.BigEndian.Uint32(fullBuf[4:8])
+			version := binary.LittleEndian.Uint32(fullBuf[4:8])
 			if version > logVersion {
 				return fmt.Errorf("flexfile: unsupported log version %d", version)
 			}
@@ -255,7 +255,7 @@ func (ff *FlexFile) redoLog() error {
 				return fmt.Errorf("redoLog: SetTag failed: %w", err)
 			}
 		case opGC:
-			ff.tree.UpdatePoff(p1, p2, p3)
+			_ = ff.tree.UpdatePoff(p1, p2, p3)
 		}
 		numReplayed++
 	}
@@ -292,7 +292,7 @@ func (ff *FlexFile) Close() error {
 	// so iterating the slice is sufficient to release all virtual address space.
 	for i, chunk := range ff.chunks {
 		if chunk != nil {
-			syscall.Munmap(chunk)
+			_ = syscall.Munmap(chunk)
 			ff.chunks[i] = nil
 		}
 	}
@@ -355,8 +355,8 @@ func (ff *FlexFile) Sync() error {
 func (ff *FlexFile) syncLog() error {
 	if ff.logTotalSize == 0 {
 		var h [16]byte
-		binary.BigEndian.PutUint32(h[0:4], logMagic)
-		binary.BigEndian.PutUint32(h[4:8], logVersion)
+		binary.LittleEndian.PutUint32(h[0:4], logMagic)
+		binary.LittleEndian.PutUint32(h[4:8], logVersion)
 		n, err := ff.logFile.WriteAt(h[:], 0)
 		if err != nil {
 			return fmt.Errorf("flexfile: log header write failed: %w", err)
@@ -474,7 +474,7 @@ func (ff *FlexFile) Read(buf []byte, loff uint64) (int, error) {
 					evictIdx := oldest.Value.(uint64)
 					ff.mmapLRU.Remove(oldest)
 					delete(ff.mmapLRUIdx, evictIdx)
-					syscall.Munmap(ff.chunks[evictIdx])
+					_ = syscall.Munmap(ff.chunks[evictIdx])
 					ff.chunks[evictIdx] = nil
 				}
 			} else if elem, ok := ff.mmapLRUIdx[chunkIdx]; ok {
@@ -588,7 +588,7 @@ func (ff *FlexFile) Update(buf []byte, loff, olen uint64) (int, error) {
 	}
 
 	if tag != 0 {
-		ff.setTagR(loff, tag, false)
+		_ = ff.setTagR(loff, tag, false)
 	}
 
 	if ff.logBufSize >= logMemCap {
@@ -852,7 +852,7 @@ func (ff *FlexFile) writeChecksums(blkID uint64, data []byte, length uint64) err
 		if c == 0 {
 			c = 0xFFFFFFFF // sentinel for a naturally-zero CRC
 		}
-		binary.BigEndian.PutUint32(b[:], c)
+		binary.LittleEndian.PutUint32(b[:], c)
 		checkOff := int64(blkID*numPagesInBlock*uint64(checksumSize) + i*uint64(checksumSize))
 		if _, err := ff.checksumFile.WriteAt(b[:], checkOff); err != nil {
 			return fmt.Errorf("flexfile: checksum write failed: %w", err)
@@ -884,7 +884,7 @@ func (ff *FlexFile) verifyChecksum(poff uint64, data []byte) error {
 			}
 			return err
 		}
-		storedCRC := binary.BigEndian.Uint32(storedCRCBuf[:])
+		storedCRC := binary.LittleEndian.Uint32(storedCRCBuf[:])
 		if storedCRC != 0 {
 			fullPage := make([]byte, pageSize)
 			chunkIdx := (blkID*blockSize + pageStart) >> chunkBits
@@ -966,7 +966,7 @@ func (ff *FlexFile) readR(buf []byte, loff uint64) (int, error) {
 					evictIdx := oldest.Value.(uint64)
 					ff.mmapLRU.Remove(oldest)
 					delete(ff.mmapLRUIdx, evictIdx)
-					syscall.Munmap(ff.chunks[evictIdx])
+					_ = syscall.Munmap(ff.chunks[evictIdx])
 					ff.chunks[evictIdx] = nil
 				}
 			} else if elem, ok := ff.mmapLRUIdx[chunkIdx]; ok {

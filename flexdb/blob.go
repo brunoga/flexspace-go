@@ -10,6 +10,12 @@ import (
 )
 
 const (
+	// blobFileMagic is the 4-byte file header for the BLOBFILE.
+	blobFileMagic = uint32(0x46424C4F) // 'FBLO'
+
+	// blobFileHeaderSize is the size of the BLOBFILE header.
+	blobFileHeaderSize = 4
+
 	// blobMagic is the 4-byte sentinel header identifying a blob reference value.
 	// A value is a blob reference if and only if it is exactly blobSentinelSize
 	// bytes and its first four bytes equal this constant.
@@ -21,11 +27,7 @@ const (
 
 	// MaxBlobSize is the maximum allowed size of a single blob value (1 GiB).
 	MaxBlobSize = 1 << 30
-
-	blobFileHeaderSize = 8
 )
-
-var blobFileHeader = [blobFileHeaderSize]byte{'F', 'L', 'E', 'X', 'B', 'L', 'O', 'B'}
 
 // blobStore is an append-only flat file that stores large values for a single
 // Table. Concurrent writers are serialised by mu; readers use pread (ReadAt),
@@ -53,7 +55,9 @@ func openBlobStore(dir string) (*blobStore, error) {
 
 	size := info.Size()
 	if size == 0 {
-		if _, err := f.Write(blobFileHeader[:]); err != nil {
+		var h [blobFileHeaderSize]byte
+		binary.LittleEndian.PutUint32(h[:], blobFileMagic)
+		if _, err := f.Write(h[:]); err != nil {
 			f.Close()
 			return nil, fmt.Errorf("write blob header: %w", err)
 		}

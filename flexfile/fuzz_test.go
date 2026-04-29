@@ -119,7 +119,7 @@ func FuzzFlexFile(f *testing.F) {
 				ff.SetTag(pos, tag)
 
 			case 5: // Sync
-				ff.Sync()
+				_ = ff.Sync()
 			}
 
 			// Verify data consistency

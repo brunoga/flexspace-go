@@ -31,7 +31,7 @@ type skipNode struct {
 }
 
 type skipList struct {
-	head  skipNode    // sentinel; tower pre-allocated at maxSkipLevel
+	head  skipNode // sentinel; tower pre-allocated at maxSkipLevel
 	level atomic.Int32
 	rng   atomic.Uint64 // xorshift64 PRNG
 }

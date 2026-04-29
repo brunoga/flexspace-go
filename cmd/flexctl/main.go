@@ -1640,7 +1640,7 @@ func (fc *flexCompleter) indexValues(tableName, indexName, prefix string) (vals 
 		return nil
 	}
 	func() {
-		defer func() { recover() }() // guard against an unregistered index
+		defer func() { _ = recover() }() // guard against an unregistered index
 		it := tbl.Index(indexName).ScanPrefix([]byte(prefix))
 		defer it.Close()
 		for ; it.Valid() && len(vals) < maxKeyCompletions; it.Next() {

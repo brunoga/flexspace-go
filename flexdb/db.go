@@ -64,7 +64,7 @@ type DB struct {
 const (
 	lockShards = 16
 
-	tableRegistryMagic   = 0x464C5852 // 'FLXR'
+	tableRegistryMagic   = 0x46524547 // 'FREG'
 	tableRegistryVersion = 1
 
 	// memtableFlushBatch is the internal batch size used by flushMT.
@@ -122,7 +122,7 @@ func Open(ctx context.Context, path string, opts *Options) (*DB, error) {
 
 	// Load existing tables from the registry and open their flexfiles.
 	if err := db.loadTablesRegistry(ctx); err != nil {
-		db.closeAll()
+		_ = db.closeAll()
 		return nil, fmt.Errorf("flexdb open: load tables: %w", err)
 	}
 
@@ -132,7 +132,7 @@ func Open(ctx context.Context, path string, opts *Options) (*DB, error) {
 		logPath := filepath.Join(db.path, fmt.Sprintf("MEMTABLE_LOG%d", i))
 		seq, err := mt.redoLog(logPath)
 		if err != nil {
-			db.closeAll()
+			_ = db.closeAll()
 			return nil, fmt.Errorf("flexdb open: replay WAL %d: %w", i, err)
 		}
 		if seq > maxSeq {
@@ -165,7 +165,7 @@ func Open(ctx context.Context, path string, opts *Options) (*DB, error) {
 	// Truncate log files and write fresh timestamp headers.
 	for i, mt := range db.memtables {
 		if err := mt.truncateLog(); err != nil {
-			db.closeAll()
+			_ = db.closeAll()
 			return nil, fmt.Errorf("flexdb open: truncate log %d: %w", i, err)
 		}
 	}
@@ -226,7 +226,7 @@ func (db *DB) DropTable(ctx context.Context, name string) error {
 		return nil // already gone
 	}
 
-	t.ff.Close()
+	_ = t.close()
 	delete(db.tablesByName, name)
 	delete(db.tablesByID, t.id)
 
@@ -604,18 +604,18 @@ func (db *DB) loadTablesRegistry(ctx context.Context) error {
 	off := 0
 
 	// Check for magic number to distinguish between legacy and v1+ formats.
-	magic := binary.BigEndian.Uint32(data[off:])
+	magic := binary.LittleEndian.Uint32(data[off:])
 	if magic == tableRegistryMagic {
 		off += 4
 		if len(data) < 12 {
 			return fmt.Errorf("table registry: truncated header")
 		}
-		version := binary.BigEndian.Uint32(data[off:])
+		version := binary.LittleEndian.Uint32(data[off:])
 		off += 4
 		if version > tableRegistryVersion {
 			return fmt.Errorf("table registry: unsupported version %d", version)
 		}
-		n = int(binary.BigEndian.Uint32(data[off:]))
+		n = int(binary.LittleEndian.Uint32(data[off:]))
 		off += 4
 	} else {
 		// Legacy format: first 4 bytes is n_tables.
@@ -632,14 +632,14 @@ func (db *DB) loadTablesRegistry(ctx context.Context) error {
 		if off+2 > len(data) {
 			break
 		}
-		nameLen := int(binary.BigEndian.Uint16(data[off:]))
+		nameLen := int(binary.LittleEndian.Uint16(data[off:]))
 		off += 2
 		if off+nameLen+4 > len(data) {
 			break
 		}
 		name := string(data[off : off+nameLen])
 		off += nameLen
-		id := binary.BigEndian.Uint32(data[off:])
+		id := binary.LittleEndian.Uint32(data[off:])
 		off += 4
 
 		t, err := db.openTable(ctx, id, name)
@@ -665,18 +665,18 @@ func (db *DB) saveTablesRegistry() error {
 
 	buf := make([]byte, size)
 	off := 0
-	binary.BigEndian.PutUint32(buf[off:], tableRegistryMagic)
+	binary.LittleEndian.PutUint32(buf[off:], tableRegistryMagic)
 	off += 4
-	binary.BigEndian.PutUint32(buf[off:], tableRegistryVersion)
+	binary.LittleEndian.PutUint32(buf[off:], tableRegistryVersion)
 	off += 4
-	binary.BigEndian.PutUint32(buf[off:], uint32(len(db.tablesByName)))
+	binary.LittleEndian.PutUint32(buf[off:], uint32(len(db.tablesByName)))
 	off += 4
 	for name, t := range db.tablesByName {
-		binary.BigEndian.PutUint16(buf[off:], uint16(len(name)))
+		binary.LittleEndian.PutUint16(buf[off:], uint16(len(name)))
 		off += 2
 		copy(buf[off:], name)
 		off += len(name)
-		binary.BigEndian.PutUint32(buf[off:], t.id)
+		binary.LittleEndian.PutUint32(buf[off:], t.id)
 		off += 4
 	}
 

@@ -106,6 +106,38 @@ The tree is persisted as two files:
 
 `Sync` uses copy-on-write: only dirty nodes are assigned new IDs and written; the metadata file is written last to guarantee crash consistency.
 
+#### FLEXTREE_NODE binary layout (1024 bytes per node)
+
+All fields are Little-Endian (the default for this codebase).
+
+| Offset | Size | Field | Description |
+|--------|------|-------|-------------|
+| 0–3 | 4 | Count | Number of entries in this node |
+| 4 | 1 | IsLeaf | `1` = leaf, `0` = internal |
+| 5–7 | 3 | (reserved) | Zero |
+| 8–15 | 8 | NodeID | Unique node identifier |
+| 16–31 | 16 | (reserved) | Zero |
+| 32–1023 | 992 | Payload | Leaf or internal data (see below) |
+
+**Leaf payload** (bytes 32–1023): up to 60 extents × 16 bytes each, stored at `32 + i×16`:
+
+| Offset within entry | Size | Field |
+|---------------------|------|-------|
+| 0–3 | 4 | `loff` — logical offset within the leaf (uint32) |
+| 4–7 | 4 | `len` — byte length of the extent (uint32) |
+| 8–15 | 8 | `pTag` — physical offset (48 bits) + metadata tag (16 bits) (uint64) |
+
+**Internal payload** (bytes 32–1023):
+- Bytes 32–271: up to 30 pivot keys × 8 bytes each (uint64), at `32 + i×8`.
+- Bytes 272–751: up to 31 child entries × 16 bytes each, at `272 + i×16`:
+
+| Offset within entry | Size | Field |
+|---------------------|------|-------|
+| 0–7 | 8 | `shift` — cumulative logical offset shift for child (int64) |
+| 8–15 | 8 | `childID` — node ID of child (uint64) |
+
+Nodes are stored in `FLEXTREE_NODE` at file offset `nodeID × 1024`; node 0 is unused (reserved).
+
 ---
 
 ## Performance

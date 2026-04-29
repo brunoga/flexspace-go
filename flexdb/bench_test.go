@@ -167,7 +167,7 @@ func benchGetFile(b *testing.B, vlen int) {
 	for i := range nkeys {
 		ref.Put(context.Background(), makeKey(i), val) //nolint:errcheck
 	}
-	ref.Sync(context.Background())
+	ref.Sync(context.Background()) //nolint:errcheck
 
 	keys := makeKeys(nkeys)
 	for i := range nkeys {
@@ -197,7 +197,7 @@ func benchGetFileView(b *testing.B, vlen int) {
 	for i := range nkeys {
 		ref.Put(context.Background(), makeKey(i), val) //nolint:errcheck
 	}
-	ref.Sync(context.Background())
+	ref.Sync(context.Background()) //nolint:errcheck
 
 	keys := makeKeys(nkeys)
 	for i := range nkeys {
@@ -252,7 +252,7 @@ func benchIterScan(b *testing.B, vlen int) {
 	for i := range nkeys {
 		ref.Put(context.Background(), makeKey(i), val) //nolint:errcheck
 	}
-	ref.Sync(context.Background())
+	ref.Sync(context.Background()) //nolint:errcheck
 
 	b.ResetTimer()
 	b.SetBytes(int64(23 + vlen))

@@ -640,13 +640,17 @@ func makePrefixedKey(tableID uint32, key []byte) []byte {
 // retain the key (GetView, Probe, Iterator.Seek, Batch.readCurrent).
 // Must NOT be used for Put/Update since those paths store the key in the skip list.
 var pkeyPool = sync.Pool{
-	New: func() any { return make([]byte, 4+MaxKVSize) },
+	New: func() any {
+		b := make([]byte, 4+MaxKVSize)
+		return &b
+	},
 }
 
 // borrowPKey returns a pooled buffer containing tableID prefix + key.
 // The caller MUST call returnPKey when done; after that the slice is invalid.
 func borrowPKey(tableID uint32, key []byte) []byte {
-	buf := pkeyPool.Get().([]byte)
+	bufptr := pkeyPool.Get().(*[]byte)
+	buf := *bufptr
 	pkey := buf[:4+len(key)]
 	binary.BigEndian.PutUint32(pkey, tableID)
 	copy(pkey[4:], key)
@@ -655,5 +659,5 @@ func borrowPKey(tableID uint32, key []byte) []byte {
 
 // returnPKey returns a slice obtained from borrowPKey to the pool.
 func returnPKey(pkey []byte) {
-	pkeyPool.Put(pkey[:cap(pkey)])
+	pkeyPool.Put(&pkey)
 }
