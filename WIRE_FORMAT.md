@@ -71,7 +71,7 @@ A stored value of `0xFFFFFFFF` is a sentinel for a natural CRC32 result of 0.
 ---
 
 ## 5. BLOBFILE
-Stored at `tables/<id>/BLOBFILE`. Append-only storage for large values (those where `len(key)+len(value) > MaxKVSize`). The file grows monotonically; no bytes are ever overwritten or reclaimed after being written.
+Stored at `tables/<id>/BLOBFILE`. Append-only storage for large values (those where `len(key)+len(value) > MaxKVSize`, or any value whose raw bytes would be misidentified as a `BLOB_SENTINEL`). The file grows monotonically; no bytes are ever overwritten or reclaimed after being written.
 
 | Offset | Size (Bytes) | Description |
 |--------|--------------|-------------|
@@ -85,12 +85,12 @@ Each blob is fdatasynced before the corresponding `BLOB_SENTINEL` is written to 
 ---
 
 ## 6. BLOB_SENTINEL
-When a value exceeds the inline threshold (`len(key)+len(value) > MaxKVSize = 4 KiB`), the value is stored in `BLOBFILE` and replaced in the KV store by a 16-byte sentinel. The sentinel is stored as the value in the memtable and on-disk intervals exactly like any other value.
+When a value exceeds the inline threshold (`len(key)+len(value) > MaxKVSize = 4 KiB`), **or** when a value is exactly 16 bytes and its first four bytes equal `0xB10BB10B` (to prevent false-positive sentinel detection on read), the value is stored in `BLOBFILE` and replaced in the KV store by a 16-byte sentinel. The sentinel is stored as the value in the memtable and on-disk intervals exactly like any other value.
 
 | Field | Size (Bytes) | Description |
 |-------|--------------|-------------|
 | Magic | 4 | `0xB10BB10B` |
-| Offset | 8 | Absolute offset in `BLOBFILE` (includes the 8-byte file header) |
+| Offset | 8 | Absolute offset in `BLOBFILE` (includes the 4-byte file header) |
 | Size | 4 | Uncompressed blob size in bytes |
 
 A value is identified as a sentinel if and only if its length is exactly 16 bytes and its first four bytes equal `0xB10BB10B`.

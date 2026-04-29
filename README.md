@@ -2,6 +2,8 @@
 
 A write-optimised, embeddable key-value store with multi-table support and secondary indexing, written in pure Go with no external dependencies.
 
+> **Platform note:** flexspace-go requires Linux. It uses `fdatasync(2)` and `mmap(2)` directly via `syscall` for durability and zero-copy reads. Other operating systems are not currently supported.
+
 This project is a Go port and evolution of [flexspace](https://github.com/flexible-address-space/flexspace), the original C implementation of the flexible address space storage engine. While the core data structures and algorithms remain faithful to the original, the Go implementation has diverged significantly: the architecture has been extended, the API redesigned for ergonomics, and several internal optimisations added that make it generally faster than the C version across common workloads — in particular sequential writes, scan-heavy reads, and multi-table operations.
 
 ---
@@ -113,7 +115,7 @@ err = users.CreateIndex(ctx, "by_role", func(_, v []byte) [][]byte {
 
 // Query the index.
 idx := users.Index("by_role")
-iit := idx.Get([]byte("engineer"))
+iit := idx.Get(ctx, []byte("engineer"))
 defer iit.Close()
 for ; iit.Valid(); iit.Next() {
     rec, _ := iit.GetRecord(ctx)
