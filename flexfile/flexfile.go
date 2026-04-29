@@ -390,6 +390,20 @@ func (ff *FlexFile) flushLogIfFull() error {
 }
 
 func (ff *FlexFile) logWrite(o op, p1, p2 uint64, p3 uint32) {
+	// Pre-flush if the buffer doesn't have room for one more entry.
+	// logMemCap is not necessarily a multiple of logEntrySize, so the
+	// "check after write" pattern used by callers leaves a small window
+	// where logBufSize can sit in (logMemCap-logEntrySize, logMemCap) and
+	// the next PutUint* write goes out of bounds.
+	if ff.logBufSize+logEntrySize > logMemCap {
+		if err := ff.syncLog(); err != nil {
+			// Sync failed; discard buffered entries to prevent the overflow
+			// panic. Durability is impaired but in-memory state is intact.
+			// The error will surface the next time the caller calls Sync().
+			ff.logBufSize = 0
+		}
+	}
+
 	v1 := uint64(o) | (p1 << 2) | (p2 << 50)
 	v2 := (p2 >> 14) | (uint64(p3) << 34)
 

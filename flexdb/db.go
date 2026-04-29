@@ -518,14 +518,16 @@ func (db *DB) flushMT(mt *memtable) error {
 			t := currentTable
 			h := hash32(userKey)
 			lockID := h & (lockShards - 1)
-			t.rwFF[lockID].Lock()
 			var err error
-			if len(e.value) == 0 {
-				err = t.deletePassthrough(userKey, &nh, fp16(h))
-			} else {
-				err = t.putPassthrough(&KV{Key: userKey, Value: e.value}, &nh)
-			}
-			t.rwFF[lockID].Unlock()
+			func() {
+				t.rwFF[lockID].Lock()
+				defer t.rwFF[lockID].Unlock()
+				if len(e.value) == 0 {
+					err = t.deletePassthrough(userKey, &nh, fp16(h))
+				} else {
+					err = t.putPassthrough(&KV{Key: userKey, Value: e.value}, &nh)
+				}
+			}()
 			if err != nil && flushErr == nil {
 				flushErr = err
 			}

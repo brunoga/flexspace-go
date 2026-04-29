@@ -2,6 +2,7 @@ package flexdb
 
 import (
 	"bytes"
+	"sync"
 	"sync/atomic"
 )
 
@@ -21,6 +22,8 @@ const skipInlineLevel = 4
 //	value atomic.Pointer[[]byte]
 //	next  [skipInlineLevel]atomic.Pointer[skipNode]
 //	tower []atomic.Pointer[skipNode]
+//
+// All pointer fields are atomic so readers can traverse without holding mu.
 type skipNode struct {
 	key   []byte
 	value atomic.Pointer[[]byte]
@@ -29,15 +32,15 @@ type skipNode struct {
 }
 
 type skipList struct {
-	head  skipNode // sentinel; tower pre-allocated
+	head  skipNode   // sentinel; tower pre-allocated at maxSkipLevel
+	mu    sync.Mutex // serializes all writes; readers are lock-free
 	level atomic.Int32
-	rng   atomic.Uint64 // xorshift64 PRNG
+	rng   uint64 // xorshift64 PRNG — only accessed under mu
 }
 
 func newSkipList() *skipList {
-	sl := &skipList{}
+	sl := &skipList{rng: 42}
 	sl.level.Store(1)
-	sl.rng.Store(42)
 	if maxSkipLevel > skipInlineLevel {
 		sl.head.tower = make([]atomic.Pointer[skipNode], maxSkipLevel-skipInlineLevel)
 	}
@@ -45,26 +48,21 @@ func newSkipList() *skipList {
 }
 
 // randomLevel returns a level in [1, maxSkipLevel] with p = 0.25.
+// Must be called with mu held.
 func (sl *skipList) randomLevel() int {
-	for {
-		old := sl.rng.Load()
-		new := old
-		new ^= new << 13
-		new ^= new >> 7
-		new ^= new << 17
-		if sl.rng.CompareAndSwap(old, new) {
-			r := new
-			lvl := 1
-			for lvl < maxSkipLevel && r&3 == 0 {
-				r >>= 2
-				lvl++
-			}
-			return lvl
-		}
+	sl.rng ^= sl.rng << 13
+	sl.rng ^= sl.rng >> 7
+	sl.rng ^= sl.rng << 17
+	r := sl.rng
+	lvl := 1
+	for lvl < maxSkipLevel && r&3 == 0 {
+		r >>= 2
+		lvl++
 	}
+	return lvl
 }
 
-// nodeNext returns the level-i next pointer of n.
+// nodeNext returns the level-i next pointer of n using an atomic load.
 func nodeNext(n *skipNode, i int) *skipNode {
 	if i < skipInlineLevel {
 		return n.next[i].Load()
@@ -76,8 +74,8 @@ func nodeNext(n *skipNode, i int) *skipNode {
 	return nil
 }
 
-// nodeSetNext sets the level-i next pointer of n.
-func nodeSetNext(n *skipNode, i int, v *skipNode) {
+// nodeStore sets the level-i next pointer of n using an atomic store.
+func nodeStore(n *skipNode, i int, v *skipNode) {
 	if i < skipInlineLevel {
 		n.next[i].Store(v)
 	} else {
@@ -85,72 +83,22 @@ func nodeSetNext(n *skipNode, i int, v *skipNode) {
 	}
 }
 
-// nodeCompareAndSwapNext updates the level-i next pointer of n using CAS.
-func nodeCompareAndSwapNext(n *skipNode, i int, old, new *skipNode) bool {
-	if i < skipInlineLevel {
-		return n.next[i].CompareAndSwap(old, new)
-	}
-	return n.tower[i-skipInlineLevel].CompareAndSwap(old, new)
-}
-
 // Set inserts or updates key with value.
-// Safe for concurrent use: multiple goroutines may call Set simultaneously.
+// Writers are serialized by mu; concurrent Gets and Seeks are lock-free.
+//
+// Insertion publishes the new node at level 0 first so that readers always
+// observe a fully-linked level-0 chain. Higher-level links follow immediately
+// (still under mu, so no other writer can interfere), and each level's forward
+// pointer is stored into the new node before the node is spliced into the
+// predecessor, guaranteeing that a reader that sees the new node at level i
+// also sees a valid forward pointer at level i.
 func (sl *skipList) Set(key, value []byte) {
-	for {
-		// Default preds to head so levels not visited by find (when the new
-		// node's height exceeds the current list height) have a valid CAS target.
-		var preds [maxSkipLevel]*skipNode
-		for i := range preds {
-			preds[i] = &sl.head
-		}
-		var succs [maxSkipLevel]*skipNode
-		found := sl.find(key, &preds, &succs)
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
 
-		if found != nil {
-			// Key exists, update value atomically.
-			v := &value
-			found.value.Store(v)
-			return
-		}
+	var preds [maxSkipLevel]*skipNode
+	var succs [maxSkipLevel]*skipNode
 
-		// Key doesn't exist, insert new node.
-		lvl := sl.randomLevel()
-		for {
-			oldLvl := sl.level.Load()
-			if int32(lvl) <= oldLvl || sl.level.CompareAndSwap(oldLvl, int32(lvl)) {
-				break
-			}
-		}
-
-		newNode := &skipNode{key: key}
-		v := &value
-		newNode.value.Store(v)
-		if lvl > skipInlineLevel {
-			newNode.tower = make([]atomic.Pointer[skipNode], lvl-skipInlineLevel)
-		}
-
-		// Link level 0 first.
-		nodeSetNext(newNode, 0, succs[0])
-		if !nodeCompareAndSwapNext(preds[0], 0, succs[0], newNode) {
-			continue // concurrent insert at level 0, retry from scratch
-		}
-
-		// Level 0 success! Now link higher levels.
-		for i := 1; i < lvl; i++ {
-			for {
-				nodeSetNext(newNode, i, succs[i])
-				if nodeCompareAndSwapNext(preds[i], i, succs[i], newNode) {
-					break // success for this level
-				}
-				// Concurrent change at this level. Re-find to get updated pred/succ.
-				sl.find(key, &preds, &succs)
-			}
-		}
-		return
-	}
-}
-
-func (sl *skipList) find(key []byte, preds *[maxSkipLevel]*skipNode, succs *[maxSkipLevel]*skipNode) *skipNode {
 	cur := &sl.head
 	level := int(sl.level.Load())
 	for i := level - 1; i >= 0; i-- {
@@ -164,13 +112,43 @@ func (sl *skipList) find(key []byte, preds *[maxSkipLevel]*skipNode, succs *[max
 			cur = nxt
 		}
 	}
+
+	// Update value in place if key already exists.
 	if succs[0] != nil && bytes.Equal(succs[0].key, key) {
-		return succs[0]
+		v := &value
+		succs[0].value.Store(v)
+		return
 	}
-	return nil
+
+	lvl := sl.randomLevel()
+	if lvl > level {
+		for i := level; i < lvl; i++ {
+			preds[i] = &sl.head
+			succs[i] = nil
+		}
+		sl.level.Store(int32(lvl))
+	}
+
+	n := &skipNode{key: key}
+	v := &value
+	n.value.Store(v)
+	if lvl > skipInlineLevel {
+		n.tower = make([]atomic.Pointer[skipNode], lvl-skipInlineLevel)
+	}
+
+	// Publish at level 0 first, then link higher levels in order.
+	// At each level: initialize n's forward pointer before splicing n in,
+	// so readers that observe n at level i always see a valid n.next[i].
+	nodeStore(n, 0, succs[0])
+	nodeStore(preds[0], 0, n)
+	for i := 1; i < lvl; i++ {
+		nodeStore(n, i, succs[i])
+		nodeStore(preds[i], i, n)
+	}
 }
 
 // Get returns (value, true) if key is present, else (nil, false).
+// Lock-free: safe to call concurrently with Set and other Gets.
 func (sl *skipList) Get(key []byte) ([]byte, bool) {
 	cur := &sl.head
 	level := int(sl.level.Load())
@@ -189,12 +167,13 @@ func (sl *skipList) Get(key []byte) ([]byte, bool) {
 		if v != nil {
 			return *v, true
 		}
-		return nil, true // logically deleted if value is nil (not possible with current Set but for safety)
+		return nil, true // tombstone (nil value pointer)
 	}
 	return nil, false
 }
 
-// Seek returns an iterator at the first key >= key.
+// Seek returns an iterator positioned at the first key >= key.
+// Lock-free: safe to call concurrently with Set.
 func (sl *skipList) Seek(key []byte) *skipIter {
 	cur := &sl.head
 	level := int(sl.level.Load())
@@ -216,8 +195,11 @@ func (sl *skipList) First() *skipIter {
 }
 
 // Clear removes all entries by severing the head's pointers.
-// Relies on Go GC to reclaim the detached nodes.
+// Callers must ensure no readers are active (memtable.reset() spins on readers
+// reaching zero before calling this).
 func (sl *skipList) Clear() {
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
 	for i := range sl.head.next {
 		sl.head.next[i].Store(nil)
 	}
@@ -225,6 +207,7 @@ func (sl *skipList) Clear() {
 		sl.head.tower[i].Store(nil)
 	}
 	sl.level.Store(1)
+	sl.rng = 42
 }
 
 // skipIter is a forward iterator over a skipList.
