@@ -39,7 +39,9 @@ func openFresh(b *testing.B, capMB uint64) (*DB, *TableRef, string) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	db, err := Open(context.Background(), dir, &Options{CacheMB: capMB})
+	opts := DefaultOptions()
+	opts.CacheMB = capMB
+	db, err := Open(context.Background(), dir, opts)
 	if err != nil {
 		os.RemoveAll(dir)
 		b.Fatal(err)
@@ -165,7 +167,7 @@ func benchGetFile(b *testing.B, vlen int) {
 	for i := range nkeys {
 		ref.Put(context.Background(), makeKey(i), val) //nolint:errcheck
 	}
-	ref.Sync(context.Background())
+	ref.Sync(context.Background()) //nolint:errcheck
 
 	keys := makeKeys(nkeys)
 	for i := range nkeys {
@@ -195,7 +197,7 @@ func benchGetFileView(b *testing.B, vlen int) {
 	for i := range nkeys {
 		ref.Put(context.Background(), makeKey(i), val) //nolint:errcheck
 	}
-	ref.Sync(context.Background())
+	ref.Sync(context.Background()) //nolint:errcheck
 
 	keys := makeKeys(nkeys)
 	for i := range nkeys {
@@ -250,7 +252,7 @@ func benchIterScan(b *testing.B, vlen int) {
 	for i := range nkeys {
 		ref.Put(context.Background(), makeKey(i), val) //nolint:errcheck
 	}
-	ref.Sync(context.Background())
+	ref.Sync(context.Background()) //nolint:errcheck
 
 	b.ResetTimer()
 	b.SetBytes(int64(23 + vlen))

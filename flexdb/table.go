@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -37,16 +38,13 @@ type Table struct {
 // Must not be shared across goroutines.
 type TableRef struct {
 	table  *Table
-	kvbuf  []byte // per-ref scratch (for future use)
 	itvbuf []byte // for loading cache entries
-	nh     nodeHandler
 }
 
 // NewRef creates a per-goroutine handle for this table.
 func (t *Table) NewRef() *TableRef {
 	return &TableRef{
 		table:  t,
-		kvbuf:  make([]byte, MaxKVSize*2),
 		itvbuf: make([]byte, (sparseInterval*MaxKVSize)+MaxKVSize),
 	}
 }
@@ -165,7 +163,6 @@ func (t *Table) initSentinel() error {
 // rebuildIndex scans the table's flexfile and rebuilds the in-memory anchor tree.
 func (t *Table) rebuildIndex() error {
 	totalSize := t.ff.Size()
-
 	if totalSize == 0 {
 		return nil
 	}
@@ -194,26 +191,30 @@ func (t *Table) rebuildIndex() error {
 		go func(workerIdx int, start, end uint64) {
 			defer wg.Done()
 			var anchors []recoveryAnchor
-			t.ff.IterateExtents(start, end, func(loff uint64, tag uint16, data []byte) bool {
-				if !fileTagIsAnchor(tag) {
-					return true
+			err := t.ff.IterateExtents(start, end, func(loff uint64, tag uint16, data []byte) bool {
+				isAnchor := fileTagIsAnchor(tag)
+				if isAnchor {
+					kv, _ := decodeKV128(data)
+					if kv == nil {
+						return true
+					}
+					var key []byte
+					if loff > 0 {
+						key = make([]byte, len(kv.Key))
+						copy(key, kv.Key)
+					} else {
+						key = []byte{}
+					}
+					anchors = append(anchors, recoveryAnchor{
+						key:      key,
+						loff:     loff,
+						unsorted: fileTagUnsorted(tag),
+					})
 				}
-				unsorted := fileTagUnsorted(tag)
-				kv, _ := decodeKV128(data)
-				if kv == nil {
-					return true
-				}
-				var key []byte
-				if loff > 0 {
-					key = make([]byte, len(kv.Key))
-					copy(key, kv.Key)
-				} else {
-					key = []byte{}
-				}
-				anchors = append(anchors, recoveryAnchor{key: key, loff: loff, unsorted: unsorted})
 				return true
 			})
 			results[workerIdx].anchors = anchors
+			results[workerIdx].err = err
 		}(i, start, end)
 	}
 	wg.Wait()
@@ -225,22 +226,22 @@ func (t *Table) rebuildIndex() error {
 		}
 		allAnchors = append(allAnchors, r.anchors...)
 	}
+
 	sort.Slice(allAnchors, func(i, j int) bool {
 		return allAnchors[i].loff < allAnchors[j].loff
 	})
 
 	for i, ra := range allAnchors {
-		psize := uint32(0)
+		var psize uint32
 		if i+1 < len(allAnchors) {
 			psize = uint32(allAnchors[i+1].loff - ra.loff)
 		} else {
 			psize = uint32(totalSize - ra.loff)
 		}
-		if ra.loff == 0 {
-			if t.tree.root != nil && t.tree.root.isLeaf && t.tree.root.count > 0 {
-				t.tree.root.anchors[0].psize = psize
-				t.tree.root.anchors[0].unsorted = ra.unsorted
-			}
+		if ra.loff == 0 && len(ra.key) == 0 {
+			a := t.tree.leafHead.anchors[0]
+			a.psize = psize
+			a.unsorted = ra.unsorted
 			continue
 		}
 		nh := t.tree.findAnchorPos(ra.key)
@@ -372,9 +373,10 @@ func (t *Table) putPassthroughCached(kv *KV, nh *nodeHandler, a *anchor, p *cach
 	anchorLoff := uint64(a.loff) + uint64(nh.shift)
 
 	newKV := dupKV(kv)
+	newSize := uint64(kv128EncodedSize(len(kv.Key), len(kv.Value)))
 
 	p.mu.Lock()
-	p.size += uint64(kv128EncodedSize(len(kv.Key), len(kv.Value)))
+	p.size += newSize
 	p.calibrate(0)
 	p.mu.Unlock()
 
@@ -389,36 +391,46 @@ func (t *Table) putPassthroughCached(kv *KV, nh *nodeHandler, a *anchor, p *cach
 
 	n := encodeKV128(t.kvbuf, newKV)
 	psize := uint32(n)
-
 	if isUpdate {
 		oldPsize := uint32(kv128EncodedSize(len(e.kvs[idx].Key), len(e.kvs[idx].Value)))
-		e.replaceKV(p, newKV, idx)
 		if _, err := t.ff.Update(t.kvbuf[:n], loff, uint64(oldPsize)); err != nil {
+			// Undo the p.size pre-adjustment so the cache size stays correct.
+			p.mu.Lock()
+			p.size -= newSize
+			p.mu.Unlock()
+			slog.Error("putPassthroughCached: Update failed", "key", string(kv.Key), "loff", loff, "oldPsize", oldPsize, "anchorLoff", anchorLoff, "idx", idx, "count", e.count, "err", err)
 			return fmt.Errorf("flexdb: Update failed: %w", err)
 		}
+		e.replaceKV(p, newKV, idx)
 		if psize != oldPsize {
 			shiftUpPropagate(nh, int64(psize)-int64(oldPsize))
 		}
 		a.psize = uint32(int32(a.psize) + int32(psize) - int32(oldPsize))
 	} else {
-		e.insertKV(p, newKV, idx)
 		if idx == 0 {
-			// Clear the anchor bit from the current first extent before shifting
-			// it forward. This may legitimately fail when the interval is empty
-			// (maxLoff == 0) because there is no extent to tag yet; the
-			// subsequent Insert creates one and the tag is set below.
-			_ = t.ff.SetTag(loff, 0)
 			if _, err := t.ff.Insert(t.kvbuf[:n], loff); err != nil {
+				p.mu.Lock()
+				p.size -= newSize
+				p.mu.Unlock()
+				slog.Error("putPassthroughCached: Insert(idx=0) failed", "key", string(kv.Key), "loff", loff, "anchorLoff", anchorLoff, "idx", idx, "count", e.count, "err", err)
 				return fmt.Errorf("flexdb: Insert failed: %w", err)
 			}
+			e.insertKV(p, newKV, idx)
 			tag := fileTagGenerate(true, a.unsorted)
 			if err := t.ff.SetTag(loff, tag); err != nil {
 				return fmt.Errorf("flexdb: SetTag failed: %w", err)
 			}
+			// Clear the anchor bit from the old first extent (now shifted forward).
+			_ = t.ff.SetTag(loff+uint64(n), 0)
 		} else {
 			if _, err := t.ff.Insert(t.kvbuf[:n], loff); err != nil {
+				p.mu.Lock()
+				p.size -= newSize
+				p.mu.Unlock()
+				slog.Error("putPassthroughCached: Insert failed", "key", string(kv.Key), "loff", loff, "anchorLoff", anchorLoff, "idx", idx, "count", e.count, "err", err)
 				return fmt.Errorf("flexdb: Insert failed: %w", err)
 			}
+			e.insertKV(p, newKV, idx)
 		}
 		shiftUpPropagate(nh, int64(psize))
 		a.psize += psize
@@ -466,8 +478,18 @@ func (t *Table) splitAnchor(nh *nodeHandler, p *cachePartition, e *cacheEntry) e
 	for i := range leftCount {
 		leftPsize += uint32(kv128EncodedSize(len(e.kvs[i].Key), len(e.kvs[i].Value)))
 	}
+
+	// Compute rightPsize from cache entries (ground truth), not from a.psize
+	// which may be stale (e.g., after WAL replay when rebuildIndex assigns psizes
+	// from phase-1 flexfile anchor distances that differ from cache reality).
+	// Using a stale a.psize here would create an anchor with a wrong psize,
+	// causing loadEntry to read past the anchor's actual data region and
+	// decode garbage bytes as cache entries, cascading into further corruption.
+	var rightPsize uint32
+	for i := leftCount; i < count; i++ {
+		rightPsize += uint32(kv128EncodedSize(len(e.kvs[i].Key), len(e.kvs[i].Value)))
+	}
 	rightLoff := anchorLoff + uint64(leftPsize)
-	rightPsize := a.psize - leftPsize
 
 	newKey := dupKey(e.kvs[leftCount].Key)
 	newAnchor := t.tree.insertAnchor(nh, newKey, rightLoff, rightPsize)
@@ -606,10 +628,36 @@ const (
 )
 
 // makePrefixedKey builds the 4-byte big-endian tableID prefix followed by the user key.
-// The returned slice is a fresh allocation.
+// The returned slice is a fresh allocation owned by the caller (safe to store in skip list).
 func makePrefixedKey(tableID uint32, key []byte) []byte {
 	pkey := make([]byte, 4+len(key))
 	binary.BigEndian.PutUint32(pkey, tableID)
 	copy(pkey[4:], key)
 	return pkey
+}
+
+// pkeyPool recycles prefixed-key buffers for read-path operations that do NOT
+// retain the key (GetView, Probe, Iterator.Seek, Batch.readCurrent).
+// Must NOT be used for Put/Update since those paths store the key in the skip list.
+var pkeyPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 4+MaxKVSize)
+		return &b
+	},
+}
+
+// borrowPKey returns a pooled buffer containing tableID prefix + key.
+// The caller MUST call returnPKey when done; after that the slice is invalid.
+func borrowPKey(tableID uint32, key []byte) []byte {
+	bufptr := pkeyPool.Get().(*[]byte)
+	buf := *bufptr
+	pkey := buf[:4+len(key)]
+	binary.BigEndian.PutUint32(pkey, tableID)
+	copy(pkey[4:], key)
+	return pkey
+}
+
+// returnPKey returns a slice obtained from borrowPKey to the pool.
+func returnPKey(pkey []byte) {
+	pkeyPool.Put(&pkey)
 }

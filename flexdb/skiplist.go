@@ -1,6 +1,9 @@
 package flexdb
 
-import "sync"
+import (
+	"bytes"
+	"sync/atomic"
+)
 
 // maxSkipLevel is the maximum height of the skip list.
 // With p=0.25, log_4(n) expected levels: 20 covers 4^20 ≈ 1 trillion entries.
@@ -12,254 +15,226 @@ const maxSkipLevel = 20
 // with p=0.5, or ~0.4% with p=0.25.
 const skipInlineLevel = 4
 
-// skipNode layout (104 bytes → sizeclass 112):
+// skipNode layout:
 //
-//	offset  0-23: key  []byte  — cache line 0
-//	offset 24-47: value []byte — cache line 0
-//	offset 48-55: next[0]      — cache line 0   ← hot level-0 traversal
-//	offset 56-63: next[1]      — cache line 0   ← hot level-1 traversal
-//	offset 64-71: next[2]      — cache line 1
-//	offset 72-79: next[3]      — cache line 1
-//	offset 80-103: tower       — cache line 1   (nil for ~94% of nodes)
+//	key   []byte
+//	value atomic.Pointer[[]byte]
+//	next  [skipInlineLevel]atomic.Pointer[skipNode]
+//	tower []atomic.Pointer[skipNode]
 //
-// Compared to the old [24]*skipNode (240 bytes = 4 cache lines), this design
-// is ~2× smaller on average: better L3 utilisation for large skip lists.
+// All pointer fields are atomic so readers and writers can proceed concurrently.
 type skipNode struct {
 	key   []byte
-	value []byte
-	next  [skipInlineLevel]*skipNode // levels 0..skipInlineLevel-1, inline
-	tower []*skipNode                // levels skipInlineLevel+, rare
+	value atomic.Pointer[[]byte]
+	next  [skipInlineLevel]atomic.Pointer[skipNode]
+	tower []atomic.Pointer[skipNode]
 }
 
-// skipNodePool recycles skipNode objects to reduce allocations on the Put path.
-// Get returns nil on first use; Set handles that by allocating fresh nodes.
-var skipNodePool = sync.Pool{}
-
 type skipList struct {
-	head  skipNode // sentinel; tower pre-allocated
-	level int
-	rng   uint64 // xorshift64 PRNG — no interface dispatch, no heap allocation
+	head  skipNode // sentinel; tower pre-allocated at maxSkipLevel
+	level atomic.Int32
+	rng   atomic.Uint64 // xorshift64 PRNG
 }
 
 func newSkipList() *skipList {
-	sl := &skipList{level: 1, rng: 42}
+	sl := &skipList{}
+	sl.level.Store(1)
+	sl.rng.Store(42)
 	if maxSkipLevel > skipInlineLevel {
-		sl.head.tower = make([]*skipNode, maxSkipLevel-skipInlineLevel)
+		sl.head.tower = make([]atomic.Pointer[skipNode], maxSkipLevel-skipInlineLevel)
 	}
 	return sl
 }
 
 // randomLevel returns a level in [1, maxSkipLevel] with p = 0.25.
-// p=0.25 keeps 75% of nodes at level 1 (no tower), reducing allocation pressure.
+// Uses a CAS-based PRNG so concurrent callers each get a distinct state.
 func (sl *skipList) randomLevel() int {
-	sl.rng ^= sl.rng << 13
-	sl.rng ^= sl.rng >> 7
-	sl.rng ^= sl.rng << 17
-	r := sl.rng
-	lvl := 1
-	for lvl < maxSkipLevel && r&3 == 0 {
-		r >>= 2
-		lvl++
+	for {
+		old := sl.rng.Load()
+		nxt := old
+		nxt ^= nxt << 13
+		nxt ^= nxt >> 7
+		nxt ^= nxt << 17
+		if sl.rng.CompareAndSwap(old, nxt) {
+			r := nxt
+			lvl := 1
+			for lvl < maxSkipLevel && r&3 == 0 {
+				r >>= 2
+				lvl++
+			}
+			return lvl
+		}
 	}
-	return lvl
 }
 
-// nodeNext returns the level-i next pointer of n.
-// Inlined helper; avoids a branch in the hot traversal loops
-// by splitting inline vs tower paths at the call sites below.
+// nodeNext returns the level-i next pointer of n using an atomic load.
 func nodeNext(n *skipNode, i int) *skipNode {
 	if i < skipInlineLevel {
-		return n.next[i]
+		return n.next[i].Load()
 	}
 	j := i - skipInlineLevel
 	if j < len(n.tower) {
-		return n.tower[j]
+		return n.tower[j].Load()
 	}
 	return nil
 }
 
-// nodeSetNext sets the level-i next pointer of n.
-func nodeSetNext(n *skipNode, i int, v *skipNode) {
+// nodeStore atomically stores v as the level-i next pointer of n.
+func nodeStore(n *skipNode, i int, v *skipNode) {
 	if i < skipInlineLevel {
-		n.next[i] = v
+		n.next[i].Store(v)
 	} else {
-		n.tower[i-skipInlineLevel] = v
+		n.tower[i-skipInlineLevel].Store(v)
 	}
 }
 
-// Set inserts or updates key with value.
-func (sl *skipList) Set(key, value []byte) {
-	var update [maxSkipLevel]*skipNode
+// nodeCAS atomically replaces n's level-i next pointer using CAS.
+// A node at level i is always in the level-i list and therefore has tower
+// capacity for level i, so the tower bounds check is a safety fallback only.
+func nodeCAS(n *skipNode, i int, old, nw *skipNode) bool {
+	if i < skipInlineLevel {
+		return n.next[i].CompareAndSwap(old, nw)
+	}
+	j := i - skipInlineLevel
+	if j < len(n.tower) {
+		return n.tower[j].CompareAndSwap(old, nw)
+	}
+	return false
+}
+
+// find locates the predecessor and successor of key at every level.
+// Returns the node at level 0 if key is already present, else nil.
+// preds[i] is set to the rightmost node at level i with key < target;
+// succs[i] is preds[i]'s level-i successor (first node with key >= target).
+func (sl *skipList) find(key []byte, preds *[maxSkipLevel]*skipNode, succs *[maxSkipLevel]*skipNode) *skipNode {
 	cur := &sl.head
-
-	// Traverse upper levels (tower path).  These levels have very few nodes
-	// so the tower backing array is nearly always cache-hot.
-	for i := sl.level - 1; i >= skipInlineLevel; i-- {
-		j := i - skipInlineLevel
+	level := int(sl.level.Load())
+	for i := level - 1; i >= 0; i-- {
 		for {
-			var nxt *skipNode
-			if j < len(cur.tower) {
-				nxt = cur.tower[j]
-			}
-			if nxt == nil || compareKeys(nxt.key, key) >= 0 {
+			nxt := nodeNext(cur, i)
+			if nxt == nil || bytes.Compare(nxt.key, key) >= 0 {
+				preds[i] = cur
+				succs[i] = nxt
 				break
 			}
 			cur = nxt
 		}
-		update[i] = cur
 	}
+	if succs[0] != nil && bytes.Equal(succs[0].key, key) {
+		return succs[0]
+	}
+	return nil
+}
 
-	// Traverse inline levels (direct array access, no function call or branch).
-	top := sl.level - 1
-	if top >= skipInlineLevel {
-		top = skipInlineLevel - 1
-	}
-	for i := top; i >= 0; i-- {
+// Set inserts or updates key with value.
+//
+// Concurrency model — fully lock-free:
+//   - Multiple writers can call Set concurrently without a mutex.
+//   - A new node is published by CAS-ing the level-0 link first so Get() always
+//     finds it at level 0 even before higher-level links are established.
+//   - At each level i: n.next[i] is stored before the predecessor's CAS so any
+//     reader that observes n at level i also sees a valid n.next[i].
+//   - preds[] is pre-filled with &sl.head so levels above the current list height
+//     (which find() does not traverse) have a valid, fully-towered CAS target.
+func (sl *skipList) Set(key, value []byte) {
+	for {
+		var preds [maxSkipLevel]*skipNode
+		for i := range preds {
+			preds[i] = &sl.head
+		}
+		var succs [maxSkipLevel]*skipNode
+		found := sl.find(key, &preds, &succs)
+
+		if found != nil {
+			v := &value
+			found.value.Store(v)
+			return
+		}
+
+		lvl := sl.randomLevel()
+		// Extend the list height if needed.
 		for {
-			nxt := cur.next[i]
-			if nxt == nil || compareKeys(nxt.key, key) >= 0 {
+			oldLvl := sl.level.Load()
+			if int32(lvl) <= oldLvl || sl.level.CompareAndSwap(oldLvl, int32(lvl)) {
 				break
 			}
-			cur = nxt
 		}
-		update[i] = cur
-	}
 
-	// Update in place if key already exists.
-	if nxt := update[0].next[0]; nxt != nil && compareKeys(nxt.key, key) == 0 {
-		nxt.value = value
+		n := &skipNode{key: key}
+		v := &value
+		n.value.Store(v)
+		if lvl > skipInlineLevel {
+			n.tower = make([]atomic.Pointer[skipNode], lvl-skipInlineLevel)
+		}
+
+		// Publish at level 0 first. If the CAS fails, someone else modified
+		// preds[0] between find() and now — restart the whole operation.
+		nodeStore(n, 0, succs[0])
+		if !nodeCAS(preds[0], 0, succs[0], n) {
+			continue
+		}
+
+		// Level 0 succeeded: n is now visible to Get() and iterators.
+		// Link higher levels one at a time. A CAS failure here only means
+		// another insert raced at that level; refind and retry that level.
+		for i := 1; i < lvl; i++ {
+			for {
+				nodeStore(n, i, succs[i])
+				if nodeCAS(preds[i], i, succs[i], n) {
+					break
+				}
+				sl.find(key, &preds, &succs)
+			}
+		}
 		return
-	}
-
-	lvl := sl.randomLevel()
-	if lvl > sl.level {
-		for i := sl.level; i < lvl; i++ {
-			update[i] = &sl.head
-		}
-		sl.level = lvl
-	}
-
-	var n *skipNode
-	if pooled, ok := skipNodePool.Get().(*skipNode); ok && pooled != nil {
-		n = pooled
-		n.key = key
-		n.value = value
-	} else {
-		n = &skipNode{key: key, value: value}
-	}
-	if lvl > skipInlineLevel {
-		need := lvl - skipInlineLevel
-		if cap(n.tower) >= need {
-			n.tower = n.tower[:need]
-		} else {
-			n.tower = make([]*skipNode, need)
-		}
-	} else {
-		n.tower = n.tower[:0]
-	}
-	for i := range lvl {
-		nodeSetNext(n, i, nodeNext(update[i], i))
-		nodeSetNext(update[i], i, n)
 	}
 }
 
 // Get returns (value, true) if key is present, else (nil, false).
+// Fully lock-free: safe to call concurrently with Set and other Gets.
 func (sl *skipList) Get(key []byte) ([]byte, bool) {
 	cur := &sl.head
-	for i := sl.level - 1; i >= skipInlineLevel; i-- {
-		j := i - skipInlineLevel
+	level := int(sl.level.Load())
+	for i := level - 1; i >= 0; i-- {
 		for {
-			var nxt *skipNode
-			if j < len(cur.tower) {
-				nxt = cur.tower[j]
-			}
-			if nxt == nil || compareKeys(nxt.key, key) >= 0 {
+			nxt := nodeNext(cur, i)
+			if nxt == nil || bytes.Compare(nxt.key, key) >= 0 {
 				break
 			}
 			cur = nxt
 		}
 	}
-	top := sl.level - 1
-	if top >= skipInlineLevel {
-		top = skipInlineLevel - 1
-	}
-	for i := top; i >= 0; i-- {
-		for {
-			nxt := cur.next[i]
-			if nxt == nil || compareKeys(nxt.key, key) >= 0 {
-				break
-			}
-			cur = nxt
+	n := nodeNext(cur, 0)
+	if n != nil && bytes.Equal(n.key, key) {
+		v := n.value.Load()
+		if v != nil {
+			return *v, true
 		}
-	}
-	n := cur.next[0]
-	if n != nil && compareKeys(n.key, key) == 0 {
-		return n.value, true
+		return nil, true // tombstone (nil value pointer)
 	}
 	return nil, false
 }
 
-// Seek returns an iterator at the first key >= key.
+// Seek returns an iterator positioned at the first key >= key.
+// Lock-free: safe to call concurrently with Set.
 func (sl *skipList) Seek(key []byte) *skipIter {
 	cur := &sl.head
-	for i := sl.level - 1; i >= skipInlineLevel; i-- {
-		j := i - skipInlineLevel
+	level := int(sl.level.Load())
+	for i := level - 1; i >= 0; i-- {
 		for {
-			var nxt *skipNode
-			if j < len(cur.tower) {
-				nxt = cur.tower[j]
-			}
-			if nxt == nil || compareKeys(nxt.key, key) >= 0 {
+			nxt := nodeNext(cur, i)
+			if nxt == nil || bytes.Compare(nxt.key, key) >= 0 {
 				break
 			}
 			cur = nxt
 		}
 	}
-	top := sl.level - 1
-	if top >= skipInlineLevel {
-		top = skipInlineLevel - 1
-	}
-	for i := top; i >= 0; i-- {
-		for {
-			nxt := cur.next[i]
-			if nxt == nil || compareKeys(nxt.key, key) >= 0 {
-				break
-			}
-			cur = nxt
-		}
-	}
-	return &skipIter{cur: cur.next[0]}
+	return &skipIter{cur: nodeNext(cur, 0)}
 }
 
 // First returns an iterator at the first (smallest) key.
 func (sl *skipList) First() *skipIter {
-	return &skipIter{cur: sl.head.next[0]}
-}
-
-// Clear removes all entries without releasing the head's tower allocation.
-// Traverses the level-0 chain and returns all nodes to skipNodePool for reuse.
-func (sl *skipList) Clear() {
-	for n := sl.head.next[0]; n != nil; {
-		next := n.next[0]
-		n.key = nil
-		n.value = nil
-		for i := range n.next {
-			n.next[i] = nil
-		}
-		// Keep the tower slice alive (capacity reused in Set).
-		for i := range n.tower {
-			n.tower[i] = nil
-		}
-		skipNodePool.Put(n)
-		n = next
-	}
-	for i := range sl.head.next {
-		sl.head.next[i] = nil
-	}
-	for i := range sl.head.tower {
-		sl.head.tower[i] = nil
-	}
-	sl.level = 1
+	return &skipIter{cur: nodeNext(&sl.head, 0)}
 }
 
 // skipIter is a forward iterator over a skipList.
@@ -267,7 +242,13 @@ type skipIter struct {
 	cur *skipNode
 }
 
-func (it *skipIter) Valid() bool   { return it.cur != nil }
-func (it *skipIter) Key() []byte   { return it.cur.key }
-func (it *skipIter) Value() []byte { return it.cur.value }
-func (it *skipIter) Next()         { it.cur = it.cur.next[0] }
+func (it *skipIter) Valid() bool { return it.cur != nil }
+func (it *skipIter) Key() []byte { return it.cur.key }
+func (it *skipIter) Value() []byte {
+	v := it.cur.value.Load()
+	if v != nil {
+		return *v
+	}
+	return nil
+}
+func (it *skipIter) Next() { it.cur = nodeNext(it.cur, 0) }

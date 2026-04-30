@@ -67,11 +67,14 @@ func (it *Iterator) Seek(key []byte) {
 	it.seekFile(key)
 
 	// Build prefixed start key for memtable seek.
+	// When key is non-nil, borrow a pooled buffer (Seek does not retain the key).
 	var pkey []byte
+	var pkeyBuf *[]byte // non-nil when pooled; must be returned after seeks complete
 	if key == nil {
 		pkey = it.tableIDBytes[:]
 	} else {
-		pkey = make([]byte, 4+len(key))
+		pkeyBuf = pkeyPool.Get().(*[]byte)
+		pkey = (*pkeyBuf)[:4+len(key)]
 		copy(pkey, it.tableIDBytes[:])
 		copy(pkey[4:], key)
 	}
@@ -102,6 +105,12 @@ func (it *Iterator) Seek(key []byte) {
 	} else {
 		it.mtIters[1] = nil
 		it.mtOK[1] = false
+	}
+
+	// Return the pooled pkey buffer now that all seeks are done.
+	if pkeyBuf != nil {
+		pkeyPool.Put(pkeyBuf)
+		pkeyBuf = nil
 	}
 
 	it.advance()
@@ -255,6 +264,24 @@ func (it *Iterator) advance() {
 
 // findMin returns the minimum user key and its source (0/1=memtable, 2=file).
 func (it *Iterator) findMin() ([]byte, int) {
+	// Fast path: determine how many sources are active and skip comparisons
+	// when only one source remains — the common case near end of iteration.
+	mt0 := it.mtOK[0]
+	mt1 := it.mtOK[1]
+	hasFile := it.fileCurrent != nil
+
+	switch {
+	case !mt0 && !mt1 && !hasFile:
+		return nil, 2
+	case !mt0 && !mt1:
+		return it.fileCurrent.Key, 2
+	case !mt1 && !hasFile:
+		return it.mtIters[0].Key()[4:], 0
+	case !mt0 && !hasFile:
+		return it.mtIters[1].Key()[4:], 1
+	}
+
+	// Multiple sources active — full comparison needed.
 	var minKey []byte
 	src := 2
 
@@ -268,7 +295,7 @@ func (it *Iterator) findMin() ([]byte, int) {
 			src = i
 		}
 	}
-	if it.fileCurrent != nil {
+	if hasFile {
 		k := it.fileCurrent.Key
 		if minKey == nil || compareKeys(k, minKey) < 0 {
 			minKey = k

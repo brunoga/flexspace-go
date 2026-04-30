@@ -35,6 +35,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -229,17 +230,18 @@ func makeIndexer(idx SchemaIndex) (flexkv.Indexer, error) {
 		if delim == "" {
 			delim = ","
 		}
+		delimBytes := []byte(delim)
 		n := idx.Field
 		return func(_, value []byte) [][]byte {
-			parts := strings.Split(string(value), delim)
+			parts := bytes.SplitN(value, delimBytes, n+2)
 			if n >= len(parts) {
 				return nil
 			}
-			f := strings.TrimSpace(parts[n])
-			if f == "" {
+			f := bytes.TrimSpace(parts[n])
+			if len(f) == 0 {
 				return nil
 			}
-			return [][]byte{[]byte(f)}
+			return [][]byte{f}
 		}, nil
 	default:
 		return nil, fmt.Errorf("unknown indexer type %q (want: prefix, suffix, exact, field)", idx.Type)
@@ -512,7 +514,7 @@ func cmdValueGet(c *ctx, args []string) {
 			printIndexScan(c.ctx, it, 0)
 			return
 		}
-		it := c.table(tableName).Index(indexName).Get(key)
+		it := c.table(tableName).Index(indexName).Get(c.ctx, key)
 		defer it.Close()
 		printIndexScan(c.ctx, it, 0)
 		return
@@ -629,7 +631,7 @@ func cmdValueCount(c *ctx, args []string) {
 			fmt.Println(c.remote.IndexCount(tableName, indexName))
 			return
 		}
-		it := c.table(tableName).Index(indexName).Scan(nil, nil)
+		it := c.table(tableName).Index(indexName).Scan(c.ctx, nil, nil)
 		defer it.Close()
 		n := 0
 		for ; it.Valid(); it.Next() {
@@ -790,7 +792,7 @@ func cmdIndexScan(c *ctx, args []string, limit int) {
 	}
 	tbl := c.table(args[0])
 	idx := tbl.Index(args[1])
-	it := idx.Scan(start, end)
+	it := idx.Scan(c.ctx, start, end)
 	defer it.Close()
 	printIndexScan(c.ctx, it, limit)
 }
@@ -805,7 +807,7 @@ func cmdIndexScanPrefix(c *ctx, args []string, limit int) {
 		printIndexScan(c.ctx, it, limit)
 		return
 	}
-	it := c.table(args[0]).Index(args[1]).ScanPrefix([]byte(args[2]))
+	it := c.table(args[0]).Index(args[1]).ScanPrefix(c.ctx, []byte(args[2]))
 	defer it.Close()
 	printIndexScan(c.ctx, it, limit)
 }
@@ -1638,8 +1640,8 @@ func (fc *flexCompleter) indexValues(tableName, indexName, prefix string) (vals 
 		return nil
 	}
 	func() {
-		defer func() { recover() }() // guard against an unregistered index
-		it := tbl.Index(indexName).ScanPrefix([]byte(prefix))
+		defer func() { _ = recover() }() // guard against an unregistered index
+		it := tbl.Index(indexName).ScanPrefix(fc.c.ctx, []byte(prefix))
 		defer it.Close()
 		for ; it.Valid() && len(vals) < maxKeyCompletions; it.Next() {
 			v := string(it.Value())

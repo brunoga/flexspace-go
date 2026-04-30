@@ -13,6 +13,11 @@ const (
 	holeBit = 1 << 47
 )
 
+// IsHole reports whether a physical offset represents a logical hole.
+func IsHole(poff uint64) bool {
+	return poff&holeBit != 0
+}
+
 // extent represents a contiguous range of logical offsets mapped to physical offsets.
 // Matches C struct flextree_extent layout: loff(4), len(4), tag(2), poff(6).
 type extent struct {

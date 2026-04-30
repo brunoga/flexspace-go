@@ -382,7 +382,7 @@ func (s *Server) handleIndexCount(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	it := tbl.Index(r.PathValue("index")).Scan(nil, nil)
+	it := tbl.Index(r.PathValue("index")).Scan(r.Context(), nil, nil)
 	defer it.Close()
 	n := 0
 	for ; it.Valid(); it.Next() {
@@ -717,9 +717,9 @@ func (s *Server) handleIndexScan(w http.ResponseWriter, r *http.Request) {
 
 	var it *flexkv.IndexIterator
 	if v := q.Get("value"); v != "" {
-		it = idx.Get([]byte(v))
+		it = idx.Get(r.Context(), []byte(v))
 	} else if p := q.Get("prefix"); p != "" {
-		it = idx.ScanPrefix([]byte(p))
+		it = idx.ScanPrefix(r.Context(), []byte(p))
 	} else {
 		var start, end []byte
 		if v := q.Get("start"); v != "" {
@@ -728,7 +728,7 @@ func (s *Server) handleIndexScan(w http.ResponseWriter, r *http.Request) {
 		if v := q.Get("end"); v != "" {
 			end = []byte(v)
 		}
-		it = idx.Scan(start, end)
+		it = idx.Scan(r.Context(), start, end)
 	}
 	defer it.Close()
 

@@ -96,7 +96,7 @@ func (b *Batch) Commit(ctx context.Context) (bool, error) {
 	// sentinel reaches the WAL the blob bytes are already on disk.
 	for i := range b.ops {
 		op := &b.ops[i]
-		if len(op.key)+len(op.value) > MaxKVSize && len(op.value) > 0 {
+		if len(op.value) > 0 && (len(op.key)+len(op.value) > MaxKVSize || isBlobSentinel(op.value)) {
 			offset, err := op.table.blobs.write(op.value)
 			if err != nil {
 				return false, err
@@ -117,15 +117,19 @@ func (b *Batch) Commit(ctx context.Context) (bool, error) {
 	}
 
 	// Wait until the active memtable has capacity (same as Put).
-	maxWait := time.Now().Add(30 * time.Second)
-	for db.activeMT().isFull() {
-		select {
-		case <-ctx.Done():
-			return false, ctx.Err()
-		case <-time.After(time.Millisecond):
-		}
-		if time.Now().After(maxWait) {
-			return false, errors.New("flexdb: timeout waiting for memtable space (is flush worker running?)")
+	if db.activeMT().isFull() {
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		deadline := time.Now().Add(30 * time.Second)
+		for db.activeMT().isFull() {
+			select {
+			case <-ctx.Done():
+				return false, ctx.Err()
+			case <-ticker.C:
+			}
+			if time.Now().After(deadline) {
+				return false, errors.New("flexdb: timeout waiting for memtable space (is flush worker running?)")
+			}
 		}
 	}
 
@@ -161,7 +165,7 @@ func (b *Batch) Commit(ctx context.Context) (bool, error) {
 
 	// Apply all ops to the skip list.
 	for _, op := range pops {
-		sz := int64(kv128EncodedSize(len(op.pkey), len(op.value)))
+		sz := uint64(kv128EncodedSize(len(op.pkey), len(op.value)))
 		mt.m.Set(op.pkey, op.value)
 		mt.size.Add(sz)
 	}
@@ -175,22 +179,26 @@ func (b *Batch) Commit(ctx context.Context) (bool, error) {
 // are expanded so that callers compare against actual blob bytes.
 func (b *Batch) readCurrent(table *Table, key []byte) ([]byte, error) {
 	db := b.db
-	pkey := makePrefixedKey(table.id, key)
+
+	// Use a pooled buffer for the prefixed key — readCurrent never stores it.
+	pkey := borrowPKey(table.id, key)
 
 	// Active memtable (hidden cannot be true: we hold all write locks).
-	if val, ok := db.activeMT().get(pkey); ok {
-		if len(val) == 0 {
+	var found []byte
+	var ok bool
+	if found, ok = db.activeMT().get(pkey); !ok {
+		// Immutable memtable (also stable: swap requires all write locks).
+		found, ok = db.immutableMT().get(pkey)
+	}
+	returnPKey(pkey) // done with pooled buffer
+
+	if ok {
+		if len(found) == 0 {
 			return nil, nil // tombstone
 		}
-		return table.expandBlob(val)
+		return table.expandBlob(found)
 	}
-	// Immutable memtable (also stable: swap requires all write locks).
-	if val, ok := db.immutableMT().get(pkey); ok {
-		if len(val) == 0 {
-			return nil, nil
-		}
-		return table.expandBlob(val)
-	}
+
 	// Flexfile (lock order: rwMT → rwFF, same as the flush path).
 	h := hash32(key)
 	ffLockID := h & (lockShards - 1)
