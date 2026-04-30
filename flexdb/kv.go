@@ -11,6 +11,12 @@ var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 // Entries that exceed this limit are automatically stored as blobs: the value
 // is written to a per-table append-only blob file and a 16-byte sentinel is
 // kept in the main KV store. Keys alone are always ≤ MaxKVSize.
+//
+// Any value that is exactly 16 bytes and whose first four bytes equal the blob
+// sentinel magic (0xB10BB10B) is also routed through the blob store to prevent
+// false-positive sentinel detection on reads. The value is stored and retrieved
+// transparently; no data is lost, but blob storage is used even for small values
+// that happen to match the pattern.
 const MaxKVSize = 4 << 10
 
 // KV represents a key-value pair. A zero-length Value is a tombstone (deletion).

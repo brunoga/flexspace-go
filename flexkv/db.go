@@ -284,6 +284,25 @@ func (t *Table) CreateIndex(ctx context.Context, name string, indexer Indexer) e
 	return nil
 }
 
+// CompactBlobs rewrites the blob files for the data table and all open index
+// tables, retaining only live blob values. Dead blobs left by deletes or
+// overwrites are discarded, reclaiming disk space.
+//
+// See flexdb.Table.CompactBlobs for details and crash-safety guarantees.
+func (t *Table) CompactBlobs(ctx context.Context) error {
+	if err := t.dataFDB.CompactBlobs(ctx); err != nil {
+		return fmt.Errorf("flexkv: compact blobs for %q: %w", t.name, err)
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	for name, ft := range t.indexFDB {
+		if err := ft.CompactBlobs(ctx); err != nil {
+			return fmt.Errorf("flexkv: compact blobs for index %q of %q: %w", name, t.name, err)
+		}
+	}
+	return nil
+}
+
 // RawDataTable returns the flexdb table backing this table's primary data.
 // Intended for diagnostics only.
 func (t *Table) RawDataTable() *flexdb.Table {

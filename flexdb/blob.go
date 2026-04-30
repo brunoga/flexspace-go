@@ -100,6 +100,13 @@ func (bs *blobStore) read(offset uint64, size uint32) ([]byte, error) {
 }
 
 func (bs *blobStore) sync() error {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	return bs.syncLocked()
+}
+
+// syncLocked flushes the blob file to disk. Caller must hold bs.mu.
+func (bs *blobStore) syncLocked() error {
 	if _, _, errno := syscall.Syscall(syscall.SYS_FDATASYNC, bs.f.Fd(), 0, 0); errno != 0 {
 		return fmt.Errorf("blob fdatasync: %w", errno)
 	}
@@ -107,7 +114,9 @@ func (bs *blobStore) sync() error {
 }
 
 func (bs *blobStore) close() error {
-	syncErr := bs.sync()
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	syncErr := bs.syncLocked()
 	closeErr := bs.f.Close()
 	if syncErr != nil {
 		return syncErr

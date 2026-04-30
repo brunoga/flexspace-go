@@ -33,6 +33,10 @@ type memtable struct {
 	// Hidden from Get() while being replayed or flushed.
 	hidden atomic.Bool
 
+	// logDiskBytes tracks the number of WAL bytes flushed to disk (not counting the
+	// current in-memory buffer). Used by the flush worker to enforce MaxWALBytes.
+	logDiskBytes atomic.Int64
+
 	// Write-ahead log state.
 	mu     sync.Mutex
 	logFd  *os.File
@@ -184,10 +188,12 @@ func (mt *memtable) flushLogLocked() error {
 	if mt.logOff == 0 {
 		return nil
 	}
-	if _, err := mt.logFd.Write(mt.logBuf[:mt.logOff]); err != nil {
+	n := mt.logOff
+	if _, err := mt.logFd.Write(mt.logBuf[:n]); err != nil {
 		return err
 	}
 	mt.logOff = 0
+	mt.logDiskBytes.Add(int64(n))
 	// Use fdatasync for performance.
 	if _, _, errno := syscall.Syscall(syscall.SYS_FDATASYNC, mt.logFd.Fd(), 0, 0); errno != 0 {
 		return errno
@@ -205,6 +211,7 @@ func (mt *memtable) truncateLog() error {
 		return err
 	}
 	mt.logOff = 0
+	mt.logDiskBytes.Store(16) // reset to header-only size
 	// Header: [timestamp:8][seq:8]
 	var h [16]byte
 	binary.LittleEndian.PutUint64(h[0:8], uint64(time.Now().Unix()))
@@ -392,8 +399,11 @@ func (w *flushWorker) run() {
 
 		case <-msTimer.C:
 			active := w.db.activeMT()
+			walOver := w.db.maxWALBytes > 0 &&
+				active.logDiskBytes.Load() >= w.db.maxWALBytes
 			shouldFlush := active.isFull() ||
-				time.Since(lastFlush) >= w.db.flushInter
+				time.Since(lastFlush) >= w.db.flushInter ||
+				walOver
 
 			if shouldFlush && !active.hidden.Load() {
 				w.db.swapAndFlush()

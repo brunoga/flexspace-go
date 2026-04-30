@@ -25,6 +25,11 @@ const (
 	roleRead  = "read"
 	roleWrite = "write"
 	roleAdmin = "admin"
+
+	// maxScanQueryParam caps the byte length of scan query parameters (prefix,
+	// start, end, value). A very long parameter would be passed directly into the
+	// underlying iterator with no benefit and potential DoS impact.
+	maxScanQueryParam = 4096
 )
 
 type contextKey int
@@ -468,7 +473,9 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.Itoa(len(val)))
 	w.WriteHeader(http.StatusOK)
-	w.Write(val) //nolint:errcheck
+	if _, err := w.Write(val); err != nil {
+		slog.Debug("handleGet: write response", "err", err)
+	}
 }
 
 func (s *Server) handleExists(w http.ResponseWriter, r *http.Request) {
@@ -566,14 +573,23 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 
 	var it *flexkv.Iterator
 	if prefix := q.Get("prefix"); prefix != "" {
+		if len(prefix) > maxScanQueryParam {
+			apiError(w, http.StatusBadRequest, "prefix exceeds maximum length")
+			return
+		}
 		it = tbl.ScanPrefix([]byte(prefix))
 	} else {
-		var start, end []byte
-		if v := q.Get("start"); v != "" {
-			start = []byte(v)
+		startStr, endStr := q.Get("start"), q.Get("end")
+		if len(startStr) > maxScanQueryParam || len(endStr) > maxScanQueryParam {
+			apiError(w, http.StatusBadRequest, "start/end exceeds maximum length")
+			return
 		}
-		if v := q.Get("end"); v != "" {
-			end = []byte(v)
+		var start, end []byte
+		if startStr != "" {
+			start = []byte(startStr)
+		}
+		if endStr != "" {
+			end = []byte(endStr)
 		}
 		it = tbl.Scan(start, end)
 	}
@@ -717,16 +733,29 @@ func (s *Server) handleIndexScan(w http.ResponseWriter, r *http.Request) {
 
 	var it *flexkv.IndexIterator
 	if v := q.Get("value"); v != "" {
+		if len(v) > maxScanQueryParam {
+			apiError(w, http.StatusBadRequest, "value exceeds maximum length")
+			return
+		}
 		it = idx.Get(r.Context(), []byte(v))
 	} else if p := q.Get("prefix"); p != "" {
+		if len(p) > maxScanQueryParam {
+			apiError(w, http.StatusBadRequest, "prefix exceeds maximum length")
+			return
+		}
 		it = idx.ScanPrefix(r.Context(), []byte(p))
 	} else {
-		var start, end []byte
-		if v := q.Get("start"); v != "" {
-			start = []byte(v)
+		startStr, endStr := q.Get("start"), q.Get("end")
+		if len(startStr) > maxScanQueryParam || len(endStr) > maxScanQueryParam {
+			apiError(w, http.StatusBadRequest, "start/end exceeds maximum length")
+			return
 		}
-		if v := q.Get("end"); v != "" {
-			end = []byte(v)
+		var start, end []byte
+		if startStr != "" {
+			start = []byte(startStr)
+		}
+		if endStr != "" {
+			end = []byte(endStr)
 		}
 		it = idx.Scan(r.Context(), start, end)
 	}

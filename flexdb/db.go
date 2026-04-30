@@ -30,6 +30,7 @@ type DB struct {
 
 	memtableCap int64
 	flushInter  time.Duration
+	maxWALBytes int64
 
 	// Table registry (protected by tablesMu).
 
@@ -81,6 +82,12 @@ type Options struct {
 
 	// FlushInterval is the interval at which memtables are flushed to disk (default: 5s).
 	FlushInterval time.Duration
+
+	// MaxWALBytes is the maximum WAL file size in bytes before a forced memtable flush
+	// is triggered (default: 256 MiB). Set to 0 to disable the WAL size limit.
+	// This guards against unbounded WAL growth when the flush interval is long or
+	// writes are infrequent and never trigger a memtable-full flush.
+	MaxWALBytes int64
 }
 
 // DefaultOptions returns a set of sensible default options.
@@ -89,6 +96,7 @@ func DefaultOptions() *Options {
 		CacheMB:       64,
 		MemtableCap:   1024 << 20,
 		FlushInterval: 5 * time.Second,
+		MaxWALBytes:   256 << 20,
 	}
 }
 
@@ -106,6 +114,7 @@ func Open(ctx context.Context, path string, opts *Options) (*DB, error) {
 		capMB:        opts.CacheMB,
 		memtableCap:  opts.MemtableCap,
 		flushInter:   opts.FlushInterval,
+		maxWALBytes:  opts.MaxWALBytes,
 		tablesByName: make(map[string]*Table),
 		tablesByID:   make(map[uint32]*Table),
 	}

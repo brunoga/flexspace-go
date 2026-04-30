@@ -192,9 +192,12 @@ func cmdServe() {
 
 	srv := newServer(db, ss, cfg, initialTables)
 	httpSrv := &http.Server{
-		Addr:        cfg.Listen,
-		Handler:     srv.routes(),
-		ReadTimeout: 30 * time.Second,
+		Addr:    cfg.Listen,
+		Handler: srv.routes(),
+		// ReadHeaderTimeout caps the time to read request headers, protecting against
+		// slow-header attacks without limiting streaming scan/dump response bodies.
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
 		// WriteTimeout left at 0: scan/dump responses stream indefinitely.
 		IdleTimeout: 120 * time.Second,
 	}

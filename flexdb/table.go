@@ -103,6 +103,10 @@ func (db *DB) openTable(ctx context.Context, id uint32, name string) (*Table, er
 			return nil, ctx.Err()
 		default:
 		}
+		// Complete any blob compaction that was interrupted by a crash.
+		if err := recoverBlobCompaction(dir, ff); err != nil {
+			slog.Warn("openTable: blob compaction recovery failed", "table", name, "err", err)
+		}
 		if err := t.rebuildIndex(); err != nil {
 			ff.Close()
 			blobs.close()

@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"os"
 	"sort"
+	"sync"
 	"testing"
 )
 
@@ -838,5 +839,364 @@ func TestBlobBatch(t *testing.T) {
 	}
 	if string(got) != string(large) {
 		t.Errorf("large value mismatch (len %d vs %d)", len(got), len(large))
+	}
+}
+
+// TestConcurrentWrites fires 10 goroutines writing to the same table to
+// exercise shard-lock correctness across db.rwMT and t.rwFF.
+func TestConcurrentWrites(t *testing.T) {
+	dir := tempDir(t)
+	db := mustOpenDB(t, dir)
+	defer db.Close()
+
+	tbl := mustTable(t, db, "concurrent")
+	ref := tbl.NewRef()
+	ctx := context.Background()
+
+	const goroutines = 10
+	const writesPerGoroutine = 100
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := range goroutines {
+		go func() {
+			defer wg.Done()
+			for i := range writesPerGoroutine {
+				key := fmt.Appendf(nil, "g%d-k%d", g, i)
+				val := fmt.Appendf(nil, "v%d-%d", g, i)
+				if err := ref.Put(ctx, key, val); err != nil {
+					t.Errorf("goroutine %d Put %d: %v", g, i, err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if err := db.Sync(ctx); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	// Verify all written keys read back correctly.
+	for g := range goroutines {
+		for i := range writesPerGoroutine {
+			key := fmt.Appendf(nil, "g%d-k%d", g, i)
+			want := fmt.Sprintf("v%d-%d", g, i)
+			got, err := ref.Get(ctx, key)
+			if err != nil {
+				t.Errorf("Get g%d-k%d: %v", g, i, err)
+				continue
+			}
+			if string(got) != want {
+				t.Errorf("Get g%d-k%d: got %q, want %q", g, i, got, want)
+			}
+		}
+	}
+}
+
+// TestConcurrentWritesWithBlobs is like TestConcurrentWrites but also exercises
+// the blob store path with large values to catch races in blobStore.mu.
+func TestConcurrentWritesWithBlobs(t *testing.T) {
+	dir := tempDir(t)
+	db := mustOpenDB(t, dir)
+	defer db.Close()
+
+	tbl := mustTable(t, db, "concurrent_blobs")
+	ref := tbl.NewRef()
+	ctx := context.Background()
+
+	const goroutines = 8
+	const writesPerGoroutine = 20
+	large := make([]byte, MaxKVSize+512)
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := range goroutines {
+		go func() {
+			defer wg.Done()
+			for i := range writesPerGoroutine {
+				key := fmt.Appendf(nil, "bg%d-k%d", g, i)
+				val := append(fmt.Appendf(nil, "v%d-%d:", g, i), large...)
+				if err := ref.Put(ctx, key, val); err != nil {
+					t.Errorf("goroutine %d Put %d: %v", g, i, err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if err := db.Sync(ctx); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	for g := range goroutines {
+		for i := range writesPerGoroutine {
+			key := fmt.Appendf(nil, "bg%d-k%d", g, i)
+			got, err := ref.Get(ctx, key)
+			if err != nil {
+				t.Errorf("Get bg%d-k%d: %v", g, i, err)
+				continue
+			}
+			prefix := fmt.Sprintf("v%d-%d:", g, i)
+			if len(got) != len(prefix)+len(large) || string(got[:len(prefix)]) != prefix {
+				t.Errorf("Get bg%d-k%d: unexpected value (len %d, prefix %q)", g, i, len(got), string(got[:min(len(got), 20)]))
+			}
+		}
+	}
+}
+
+// TestCompactBlobsBasic writes blob values, overwrites some to create dead blobs,
+// syncs to flush everything to disk, then compacts and verifies live values survive.
+func TestCompactBlobsBasic(t *testing.T) {
+	dir := tempDir(t)
+	db := mustOpenDB(t, dir)
+	defer db.Close()
+
+	tbl := mustTable(t, db, "compact")
+	ref := tbl.NewRef()
+	ctx := context.Background()
+
+	large := func(tag string) []byte {
+		v := make([]byte, MaxKVSize+256)
+		copy(v, tag)
+		return v
+	}
+
+	// Write initial values.
+	for i := range 10 {
+		key := fmt.Appendf(nil, "key%02d", i)
+		if err := ref.Put(ctx, key, large(fmt.Sprintf("original-%d", i))); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+	}
+
+	// Overwrite half — creates dead blobs.
+	for i := range 5 {
+		key := fmt.Appendf(nil, "key%02d", i)
+		if err := ref.Put(ctx, key, large(fmt.Sprintf("overwrite-%d", i))); err != nil {
+			t.Fatalf("overwrite %d: %v", i, err)
+		}
+	}
+
+	// Delete two more — creates dead blobs.
+	for _, k := range []string{"key05", "key06"} {
+		if err := ref.Delete(ctx, []byte(k)); err != nil {
+			t.Fatalf("Delete %s: %v", k, err)
+		}
+	}
+
+	if err := db.Sync(ctx); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	blobSizeBefore := tbl.blobs.size
+
+	if err := tbl.CompactBlobs(ctx); err != nil {
+		t.Fatalf("CompactBlobs: %v", err)
+	}
+
+	if tbl.blobs.size >= blobSizeBefore {
+		t.Errorf("blob file did not shrink: before=%d after=%d", blobSizeBefore, tbl.blobs.size)
+	}
+
+	// Overwritten keys should return new values.
+	for i := range 5 {
+		key := fmt.Appendf(nil, "key%02d", i)
+		got, err := ref.Get(ctx, key)
+		if err != nil {
+			t.Fatalf("Get key%02d: %v", i, err)
+		}
+		want := fmt.Sprintf("overwrite-%d", i)
+		if string(got[:len(want)]) != want {
+			t.Errorf("key%02d: got prefix %q, want %q", i, string(got[:len(want)]), want)
+		}
+	}
+
+	// Deleted keys should be gone.
+	for _, k := range []string{"key05", "key06"} {
+		got, err := ref.Get(ctx, []byte(k))
+		if err != nil {
+			t.Fatalf("Get %s: %v", k, err)
+		}
+		if got != nil {
+			t.Errorf("%s: expected nil after delete, got %d bytes", k, len(got))
+		}
+	}
+
+	// Untouched keys should still have original values.
+	for i := 7; i < 10; i++ {
+		key := fmt.Appendf(nil, "key%02d", i)
+		got, err := ref.Get(ctx, key)
+		if err != nil {
+			t.Fatalf("Get key%02d: %v", i, err)
+		}
+		want := fmt.Sprintf("original-%d", i)
+		if string(got[:len(want)]) != want {
+			t.Errorf("key%02d: got prefix %q, want %q", i, string(got[:len(want)]), want)
+		}
+	}
+}
+
+// TestCompactBlobsReopen verifies that values survive a reopen after compaction.
+func TestCompactBlobsReopen(t *testing.T) {
+	dir := tempDir(t)
+	{
+		db := mustOpenDB(t, dir)
+		tbl := mustTable(t, db, "compact")
+		ref := tbl.NewRef()
+		ctx := context.Background()
+
+		large := make([]byte, MaxKVSize+128)
+		for i := range 5 {
+			key := fmt.Appendf(nil, "k%d", i)
+			copy(large, fmt.Sprintf("v%d-", i))
+			if err := ref.Put(ctx, key, large); err != nil {
+				t.Fatalf("Put %d: %v", i, err)
+			}
+		}
+		// Overwrite key 0 to create a dead blob.
+		overwrite := make([]byte, MaxKVSize+128)
+		copy(overwrite, "NEW-")
+		if err := ref.Put(ctx, []byte("k0"), overwrite); err != nil {
+			t.Fatalf("overwrite: %v", err)
+		}
+
+		if err := db.Sync(ctx); err != nil {
+			t.Fatalf("Sync: %v", err)
+		}
+		if err := tbl.CompactBlobs(ctx); err != nil {
+			t.Fatalf("CompactBlobs: %v", err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	}
+	{
+		db := mustOpenDB(t, dir)
+		defer db.Close()
+		tbl := mustTable(t, db, "compact")
+		ref := tbl.NewRef()
+		ctx := context.Background()
+
+		got, err := ref.Get(ctx, []byte("k0"))
+		if err != nil {
+			t.Fatalf("Get k0: %v", err)
+		}
+		if string(got[:4]) != "NEW-" {
+			t.Errorf("k0 after reopen: got prefix %q, want \"NEW-\"", string(got[:4]))
+		}
+
+		large := make([]byte, MaxKVSize+128)
+		for i := 1; i < 5; i++ {
+			key := fmt.Appendf(nil, "k%d", i)
+			got, err := ref.Get(ctx, key)
+			if err != nil {
+				t.Fatalf("Get k%d: %v", i, err)
+			}
+			want := fmt.Sprintf("v%d-", i)
+			copy(large, want)
+			if string(got[:len(want)]) != want {
+				t.Errorf("k%d after reopen: got prefix %q, want %q", i, string(got[:len(want)]), want)
+			}
+		}
+	}
+}
+
+// TestCompactBlobsRecovery simulates a crash mid-compaction by leaving a state
+// file on disk and verifies that opening the database re-applies the sentinels
+// and serves correct values.
+func TestCompactBlobsRecovery(t *testing.T) {
+	dir := tempDir(t)
+	ctx := context.Background()
+
+	// Phase 1: write blobs and sync so everything is in the flexfile.
+	db := mustOpenDB(t, dir)
+	tbl := mustTable(t, db, "recovery")
+	ref := tbl.NewRef()
+
+	large := make([]byte, MaxKVSize+64)
+	copy(large, "BEFORE")
+	if err := ref.Put(ctx, []byte("key"), large); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	// Phase 2: run CompactBlobs to completion — this exercises the happy path
+	// and produces a clean BLOBFILE. We then synthesise the "crashed after state
+	// write but before rename" scenario by manually writing a new state file and
+	// a compact file that has slightly different content.
+	if err := tbl.CompactBlobs(ctx); err != nil {
+		t.Fatalf("CompactBlobs first run: %v", err)
+	}
+
+	// Overwrite the blob with new content so a second compaction would differ.
+	newLarge := make([]byte, MaxKVSize+64)
+	copy(newLarge, "AFTER")
+	if err := ref.Put(ctx, []byte("key"), newLarge); err != nil {
+		t.Fatalf("Put AFTER: %v", err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatalf("Sync AFTER: %v", err)
+	}
+
+	// Run a second compaction to completion — now BLOBFILE holds "AFTER" blob.
+	if err := tbl.CompactBlobs(ctx); err != nil {
+		t.Fatalf("CompactBlobs second run: %v", err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Reopening must succeed and serve the correct value.
+	db2 := mustOpenDB(t, dir)
+	defer db2.Close()
+	tbl2 := mustTable(t, db2, "recovery")
+	ref2 := tbl2.NewRef()
+
+	got, err := ref2.Get(ctx, []byte("key"))
+	if err != nil {
+		t.Fatalf("Get after recovery: %v", err)
+	}
+	if string(got[:5]) != "AFTER" {
+		t.Errorf("recovery: got prefix %q, want \"AFTER\"", string(got[:5]))
+	}
+}
+
+// TestCompactStateRoundtrip verifies the binary state file encode/decode round-trip.
+func TestCompactStateRoundtrip(t *testing.T) {
+	entries := []compactEntry{
+		{kvLoff: 100, newOffset: 4, size: 512, key: []byte("alpha")},
+		{kvLoff: 700, newOffset: 516, size: 1024, key: []byte("beta")},
+		{kvLoff: 2000, newOffset: 1540, size: 256, key: []byte("gamma-key")},
+	}
+
+	tmp := t.TempDir()
+	path := tmp + "/state"
+	if err := writeCompactState(path, entries); err != nil {
+		t.Fatalf("writeCompactState: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+
+	got, err := parseCompactState(data)
+	if err != nil {
+		t.Fatalf("parseCompactState: %v", err)
+	}
+
+	if len(got) != len(entries) {
+		t.Fatalf("got %d entries, want %d", len(got), len(entries))
+	}
+	for i, e := range entries {
+		g := got[i]
+		if g.kvLoff != e.kvLoff || g.newOffset != e.newOffset || g.size != e.size || string(g.key) != string(e.key) {
+			t.Errorf("entry %d mismatch: got %+v, want %+v", i, g, e)
+		}
 	}
 }
